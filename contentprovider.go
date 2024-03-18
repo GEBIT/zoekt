@@ -319,7 +319,12 @@ func (p *contentProvider) fillContentChunkMatches(ms []*candidateMatch, numConte
 			startOffset := cm.byteOffset
 			endOffset := cm.byteOffset + cm.byteMatchSz
 			startLine := newlines.atOffset(startOffset)
-			endLine := newlines.atOffset(endOffset - 1) // TODO comment/justify the -1
+			endLine := newlines.atOffset(
+				// We want the line of the last byte in the match, not the first byte outside of the match.
+				// For a zero-length match, endOffset-1 could be before match start, so fall back to the
+				// byte after the match (as we do for startLine), not before.
+				max(startOffset, endOffset-1),
+			)
 
 			ranges = append(ranges, Range{
 				Start: Location{
@@ -454,7 +459,6 @@ type newlines struct {
 // line end). The line end is the index of a newline, or the filesize
 // (if matching the last line of the file.)
 func (nls newlines) atOffset(offset uint32) (lineNumber int) {
-	// TODO: can this use slices.BinarySearch now?
 	idx := sort.Search(len(nls.locs), func(n int) bool {
 		return nls.locs[n] >= offset
 	})
