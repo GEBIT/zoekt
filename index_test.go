@@ -235,7 +235,7 @@ func TestNewlines(t *testing.T) {
 		want := []FileMatch{{
 			FileName: "filename",
 			ChunkMatches: []ChunkMatch{{
-				Content: []byte("line2"),
+				Content: []byte("line2\n"),
 				ContentStart: Location{
 					ByteOffset: 6,
 					LineNumber: 2,
