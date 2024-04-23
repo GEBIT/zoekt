@@ -1,0 +1,29 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates bind-tools tini bash curl git
+
+# Run as non-root user sourcegraph. External volumes should be mounted under /data (which will be owned by sourcegraph).
+RUN mkdir -p /home/sourcegraph
+RUN addgroup -S sourcegraph && adduser -S -G sourcegraph -h /home/sourcegraph sourcegraph && mkdir -p /data && chown -R sourcegraph:sourcegraph /data
+USER sourcegraph
+WORKDIR /home/sourcegraph
+
+ENV DATA_DIR /index
+USER root
+RUN mkdir -p ${DATA_DIR} && chown -R sourcegraph:sourcegraph ${DATA_DIR}
+USER sourcegraph
+
+# We copy from the locally built zoekt image
+COPY --from=zoekt /usr/local/bin/zoekt-gebit-indexserver /usr/local/bin/
+
+# COPY --chown=sourcegraph tilt-core.git /home/sourcegraph/tilt-core.git
+# COPY --chown=sourcegraph till-dev.git /home/sourcegraph/till-dev.git
+# COPY start-index.sh /usr/local/bin/start-index.sh
+
+# zoekt-webserver has a large stable heap size (10s of gigs), and as such the
+# default GOGC=100 could be better tuned. https://dave.cheney.net/tag/gogc
+# In go1.18 the GC changed significantly and from experimentation we tuned it
+# down from 50 to 25.
+# ENV GOGC=25
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/zoekt-gebit-indexserver", "-index_dir", "${DATA_DIR}"]
