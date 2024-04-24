@@ -4,7 +4,7 @@ RUN apk add --no-cache ca-certificates bind-tools tini bash curl git
 
 # Run as non-root user sourcegraph. External volumes should be mounted under /data (which will be owned by sourcegraph).
 RUN mkdir -p /home/sourcegraph
-RUN addgroup -S sourcegraph && adduser -S -G sourcegraph -h /home/sourcegraph sourcegraph && mkdir -p /data && chown -R sourcegraph:sourcegraph /data
+RUN addgroup -g 998 -S sourcegraph && adduser -u 998 -S -G sourcegraph -h /home/sourcegraph sourcegraph && mkdir -p /data && chown -R sourcegraph:sourcegraph /data
 USER sourcegraph
 WORKDIR /home/sourcegraph
 
@@ -26,4 +26,4 @@ COPY --from=zoekt /usr/local/bin/zoekt-gebit-indexserver /usr/local/bin/
 # down from 50 to 25.
 # ENV GOGC=25
 
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/zoekt-gebit-indexserver", "-index_dir", "${DATA_DIR}"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/zoekt-gebit-indexserver"]

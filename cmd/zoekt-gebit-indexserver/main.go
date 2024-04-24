@@ -119,6 +119,12 @@ func startIndexingApi(listen string) {
 	}
 }
 
+// example curl:
+//
+//	curl --header "Content-Type: application/json" \
+//	  --request POST \
+//	  --data '{"repoDir":"/home/sourcegraph/till-dev.git"}' \
+//	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -131,7 +137,6 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, ok := markedForIndex[req.RepoDir]
-	// If the key exists
 	if !ok {
 		respondWithError(w, err)
 		return
