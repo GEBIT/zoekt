@@ -39,7 +39,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const INDEX_PERIOD_S = 30
+const (
+	INDEX_PERIOD_S        = 60
+	ORPHAN_CHECK_PERIOD_S = 300
+)
 
 type indexRequest struct {
 	RepoDir string
@@ -86,8 +89,8 @@ func deleteIfOrphan(fn string) error {
 	return err
 }
 
-func deleteOrphanIndexes(indexDir string, watchInterval time.Duration) {
-	t := time.NewTicker(watchInterval)
+func deleteOrphanIndexes(indexDir string) {
+	t := time.NewTicker(ORPHAN_CHECK_PERIOD_S * time.Second)
 
 	expr := indexDir + "/*"
 	for {
@@ -252,7 +255,7 @@ func run() int {
 	}
 	log.Println("LanguageMap set")
 
-	go deleteOrphanIndexes(*indexDir, 10*time.Second)
+	go deleteOrphanIndexes(*indexDir)
 
 	log.Println("deleteOrphanIndexes started")
 
