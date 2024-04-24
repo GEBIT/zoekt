@@ -90,7 +90,7 @@ func deleteIfOrphan(fn string) error {
 }
 
 func deleteOrphanIndexes(indexDir string) {
-	t := time.NewTicker(ORPHAN_CHECK_PERIOD_S * time.Second)
+	t := time.NewTicker(time.Second * ORPHAN_CHECK_PERIOD_S)
 
 	expr := indexDir + "/*"
 	for {
