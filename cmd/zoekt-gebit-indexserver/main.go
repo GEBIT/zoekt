@@ -48,7 +48,10 @@ type indexRequest struct {
 	RepoDir string
 }
 
-var markedForIndex = map[string]bool{}
+var (
+	markedForIndex = map[string]bool{}
+	indexRunning   = map[string]bool{}
+)
 
 /////////////////////////////////////////////////////////////////////
 // delete*Orphan* ORIGINALLY TAKEN FROM cmd/zoekt-indexserver/main.go
@@ -168,6 +171,22 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func indexRepo(repoDir string, gitOpts gitindex.Options, markedForIndex map[string]bool) error {
+	indexRunning[repoDir] = true
+	for markedForIndex[repoDir] {
+		markedForIndex[repoDir] = false
+		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
+		err := gitindex.IndexGitRepo(gitOpts)
+		if err != nil {
+			log.Printf("indexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
+			indexRunning[repoDir] = false
+			return err
+		}
+	}
+	indexRunning[repoDir] = false
+	return nil
+}
+
 func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `file`")
 
@@ -219,7 +238,6 @@ func run() int {
 	opts.DocumentRanksPath = *offlineRanking
 	opts.DocumentRanksVersion = *offlineRankingVersion
 	opts.IndexDir = *indexDir
-	log.Printf("opts: %v", opts)
 
 	var branches []string
 	if *branchesStr != "" {
@@ -265,6 +283,7 @@ func run() int {
 	}
 	defer watcher.Close()
 
+	// init
 	exitStatus := 0
 	for repoDir, name := range gitRepos {
 		opts.RepositoryDescription.Name = name
@@ -279,9 +298,7 @@ func run() int {
 			RepoDir:                           repoDir,
 			DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
 		}
-		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, opts.RepositoryDescription.Name)
-		if err := gitindex.IndexGitRepo(gitOpts); err != nil {
-			log.Printf("indexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
+		if err := indexRepo(repoDir, gitOpts, markedForIndex); err != nil {
 			exitStatus = 1
 		}
 
@@ -290,6 +307,7 @@ func run() int {
 			log.Fatal(err)
 		}
 		markedForIndex[repoDir] = false
+		indexRunning[repoDir] = false
 	}
 
 	// Start listening for fs events.
@@ -307,7 +325,25 @@ func run() int {
 					log.Println("removed file:", repoFile)
 					if repoFile == "HEAD.lock" {
 						markedForIndex[repoDir] = true
-						log.Println("markedForIndex in watch:", markedForIndex)
+						log.Printf("push detected for repoDir: %v", repoDir)
+						if !indexRunning[repoDir] {
+							log.Println("run index for repoDir:", repoDir)
+							opts.RepositoryDescription.Name = gitRepos[repoDir]
+							gitOpts := gitindex.Options{
+								BranchPrefix:                      *branchPrefix,
+								Incremental:                       *incremental,
+								Submodules:                        *submodules,
+								RepoCacheDir:                      *repoCacheDir,
+								AllowMissingBranch:                *allowMissing,
+								BuildOptions:                      *opts,
+								Branches:                          branches,
+								RepoDir:                           repoDir,
+								DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
+							}
+							go indexRepo(repoDir, gitOpts, markedForIndex)
+						} else {
+							log.Printf("index for repoDir %v already running, marked again", repoDir)
+						}
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -316,39 +352,6 @@ func run() int {
 				}
 				log.Println("error:", err)
 			}
-		}
-	}()
-
-	// indexer loop
-	go func() {
-		for {
-			log.Println("markedForIndex in indexer:", markedForIndex)
-			for repoDir, marked := range markedForIndex {
-				if marked {
-					opts.RepositoryDescription.Name = gitRepos[repoDir]
-					gitOpts := gitindex.Options{
-						BranchPrefix:                      *branchPrefix,
-						Incremental:                       *incremental,
-						Submodules:                        *submodules,
-						RepoCacheDir:                      *repoCacheDir,
-						AllowMissingBranch:                *allowMissing,
-						BuildOptions:                      *opts,
-						Branches:                          branches,
-						RepoDir:                           repoDir,
-						DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
-					}
-					log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, opts.RepositoryDescription.Name)
-					if err := gitindex.IndexGitRepo(gitOpts); err != nil {
-						log.Printf("indexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
-						exitStatus = 1
-					}
-					markedForIndex[repoDir] = false
-				}
-				// re-watch to account for deleted and re-created repoDirs
-				watcher.Remove(repoDir)
-				watcher.Add(repoDir)
-			}
-			time.Sleep(time.Second * INDEX_PERIOD_S)
 		}
 	}()
 
