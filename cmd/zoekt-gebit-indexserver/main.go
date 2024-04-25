@@ -243,7 +243,6 @@ func refreshWatches(watcher *fsnotify.Watcher) {
 	for {
 		log.Println("start refreshWatches")
 		for repoDir := range gitRepos {
-			log.Printf("refreshing dir in watcher: %v", repoDir)
 			watcher.Remove(repoDir)
 			watcher.Add(repoDir)
 		}
