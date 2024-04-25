@@ -32,6 +32,7 @@ import (
 	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/cmd"
 	"github.com/sourcegraph/zoekt/ctags"
 	"github.com/sourcegraph/zoekt/gitindex"
@@ -49,8 +50,11 @@ type indexRequest struct {
 }
 
 var (
-	markedForIndex = map[string]bool{}
-	indexRunning   = map[string]bool{}
+	markedForIndex  = map[string]bool{}
+	indexRunning    = map[string]bool{}
+	gitRepos        = map[string]string{}
+	globalGitOpts   gitindex.Options
+	globalBuildOpts build.Options
 )
 
 /////////////////////////////////////////////////////////////////////
@@ -129,7 +133,7 @@ func startIndexingApi(listen string) {
 //
 //	curl --header "Content-Type: application/json" \
 //	  --request POST \
-//	  --data '{"repoDir":"/home/sourcegraph/till-dev.git"}' \
+//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git"}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -147,7 +151,13 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, err)
 		return
 	}
+
 	markedForIndex[req.RepoDir] = true
+	if err := indexRepo(req.RepoDir); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
 	response := map[string]any{
 		"Success": true,
 	}
@@ -171,7 +181,14 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func indexRepo(repoDir string, gitOpts gitindex.Options, markedForIndex map[string]bool) error {
+func indexRepo(repoDir string) error {
+	// create copy of global opts for this index run and set run-specific values
+	opts := globalBuildOpts
+	opts.RepositoryDescription.Name = gitRepos[repoDir]
+	gitOpts := globalGitOpts
+	gitOpts.RepoDir = repoDir
+	gitOpts.BuildOptions = opts
+
 	indexRunning[repoDir] = true
 	for markedForIndex[repoDir] {
 		markedForIndex[repoDir] = false
@@ -233,18 +250,17 @@ func run() int {
 	}
 	log.Println("repoCacheDir set")
 
-	opts := cmd.OptionsFromFlags()
-	opts.IsDelta = *isDelta
-	opts.DocumentRanksPath = *offlineRanking
-	opts.DocumentRanksVersion = *offlineRankingVersion
-	opts.IndexDir = *indexDir
+	globalBuildOpts = *cmd.OptionsFromFlags()
+	globalBuildOpts.IsDelta = *isDelta
+	globalBuildOpts.DocumentRanksPath = *offlineRanking
+	globalBuildOpts.DocumentRanksVersion = *offlineRankingVersion
+	globalBuildOpts.IndexDir = *indexDir
 
 	var branches []string
 	if *branchesStr != "" {
 		branches = strings.Split(*branchesStr, ",")
 	}
 
-	gitRepos := map[string]string{}
 	for _, repoDir := range flag.Args() {
 		repoDir, err := filepath.Abs(repoDir)
 		if err != nil {
@@ -263,15 +279,27 @@ func run() int {
 	}
 	log.Println("gitRepos set")
 
-	opts.LanguageMap = make(ctags.LanguageMap)
+	globalBuildOpts.LanguageMap = make(ctags.LanguageMap)
 	for _, mapping := range strings.Split(*languageMap, ",") {
 		m := strings.Split(mapping, ":")
 		if len(m) != 2 {
 			continue
 		}
-		opts.LanguageMap[m[0]] = ctags.StringToParser(m[1])
+		globalBuildOpts.LanguageMap[m[0]] = ctags.StringToParser(m[1])
 	}
 	log.Println("LanguageMap set")
+
+	globalGitOpts = gitindex.Options{
+		BranchPrefix:                      *branchPrefix,
+		Incremental:                       *incremental,
+		Submodules:                        *submodules,
+		RepoCacheDir:                      *repoCacheDir,
+		AllowMissingBranch:                *allowMissing,
+		BuildOptions:                      globalBuildOpts,
+		Branches:                          branches,
+		RepoDir:                           "",
+		DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
+	}
 
 	go deleteOrphanIndexes(*indexDir)
 
@@ -283,22 +311,12 @@ func run() int {
 	}
 	defer watcher.Close()
 
-	// init
+	// initial index run and watch setup
 	exitStatus := 0
-	for repoDir, name := range gitRepos {
-		opts.RepositoryDescription.Name = name
-		gitOpts := gitindex.Options{
-			BranchPrefix:                      *branchPrefix,
-			Incremental:                       *incremental,
-			Submodules:                        *submodules,
-			RepoCacheDir:                      *repoCacheDir,
-			AllowMissingBranch:                *allowMissing,
-			BuildOptions:                      *opts,
-			Branches:                          branches,
-			RepoDir:                           repoDir,
-			DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
-		}
-		if err := indexRepo(repoDir, gitOpts, markedForIndex); err != nil {
+	for repoDir := range gitRepos {
+
+		markedForIndex[repoDir] = true
+		if err := indexRepo(repoDir); err != nil {
 			exitStatus = 1
 		}
 
@@ -306,8 +324,6 @@ func run() int {
 		if err := watcher.Add(repoDir); err != nil {
 			log.Fatal(err)
 		}
-		markedForIndex[repoDir] = false
-		indexRunning[repoDir] = false
 	}
 
 	// Start listening for fs events.
@@ -324,23 +340,11 @@ func run() int {
 					repoDir := filepath.Dir(event.Name)
 					log.Println("removed file:", repoFile)
 					if repoFile == "HEAD.lock" {
-						markedForIndex[repoDir] = true
 						log.Printf("push detected for repoDir: %v", repoDir)
+						markedForIndex[repoDir] = true
 						if !indexRunning[repoDir] {
 							log.Println("run index for repoDir:", repoDir)
-							opts.RepositoryDescription.Name = gitRepos[repoDir]
-							gitOpts := gitindex.Options{
-								BranchPrefix:                      *branchPrefix,
-								Incremental:                       *incremental,
-								Submodules:                        *submodules,
-								RepoCacheDir:                      *repoCacheDir,
-								AllowMissingBranch:                *allowMissing,
-								BuildOptions:                      *opts,
-								Branches:                          branches,
-								RepoDir:                           repoDir,
-								DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
-							}
-							go indexRepo(repoDir, gitOpts, markedForIndex)
+							go indexRepo(repoDir)
 						} else {
 							log.Printf("index for repoDir %v already running, marked again", repoDir)
 						}
