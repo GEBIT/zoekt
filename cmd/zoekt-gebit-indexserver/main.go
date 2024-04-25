@@ -41,8 +41,9 @@ import (
 )
 
 const (
-	INDEX_PERIOD_S        = 60
-	ORPHAN_CHECK_PERIOD_S = 300
+	INDEX_PERIOD_S         = 60
+	WATCH_REFRESH_PERIOD_S = 60
+	ORPHAN_CHECK_PERIOD_S  = 300
 )
 
 type indexRequest struct {
@@ -204,6 +205,52 @@ func indexRepo(repoDir string) error {
 	return nil
 }
 
+func watchRepoDirs(watcher *fsnotify.Watcher) {
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			log.Println("watcher event:", event)
+			if event.Has(fsnotify.Remove) {
+				repoFile := filepath.Base(event.Name)
+				repoDir := filepath.Dir(event.Name)
+				log.Println("removed file:", repoFile)
+				if repoFile == "HEAD.lock" {
+					log.Printf("push detected for repoDir: %v", repoDir)
+					markedForIndex[repoDir] = true
+					if !indexRunning[repoDir] {
+						log.Println("run index for repoDir:", repoDir)
+						go indexRepo(repoDir)
+					} else {
+						log.Printf("index for repoDir %v already running, marked again", repoDir)
+					}
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Println("error:", err)
+		}
+	}
+}
+
+func refreshWatches(watcher *fsnotify.Watcher) {
+	t := time.NewTicker(time.Second * WATCH_REFRESH_PERIOD_S)
+
+	for {
+		log.Println("start refreshWatches")
+		for repoDir := range gitRepos {
+			log.Printf("refreshing dir in watcher: %v", repoDir)
+			watcher.Remove(repoDir)
+			watcher.Add(repoDir)
+		}
+		<-t.C
+	}
+}
+
 func run() int {
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `file`")
 
@@ -295,7 +342,7 @@ func run() int {
 		Submodules:                        *submodules,
 		RepoCacheDir:                      *repoCacheDir,
 		AllowMissingBranch:                *allowMissing,
-		BuildOptions:                      globalBuildOpts,
+		BuildOptions:                      build.Options{},
 		Branches:                          branches,
 		RepoDir:                           "",
 		DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
@@ -311,56 +358,19 @@ func run() int {
 	}
 	defer watcher.Close()
 
-	// initial index run and watch setup
+	// start watches before inital index, so we catch pushes that happen
+	// during it
+	go refreshWatches(watcher)
+	go watchRepoDirs(watcher)
+
+	// initial index run
 	exitStatus := 0
 	for repoDir := range gitRepos {
-
 		markedForIndex[repoDir] = true
 		if err := indexRepo(repoDir); err != nil {
 			exitStatus = 1
 		}
-
-		log.Println("adding dir to watcher: " + repoDir)
-		if err := watcher.Add(repoDir); err != nil {
-			log.Fatal(err)
-		}
 	}
-
-	// Start listening for fs events.
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				log.Println("event:", event)
-				if event.Has(fsnotify.Remove) {
-					repoFile := filepath.Base(event.Name)
-					repoDir := filepath.Dir(event.Name)
-					log.Println("removed file:", repoFile)
-					if repoFile == "HEAD.lock" {
-						log.Printf("push detected for repoDir: %v", repoDir)
-						markedForIndex[repoDir] = true
-						if !indexRunning[repoDir] {
-							log.Println("run index for repoDir:", repoDir)
-							go indexRepo(repoDir)
-						} else {
-							log.Printf("index for repoDir %v already running, marked again", repoDir)
-						}
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("error:", err)
-			}
-		}
-	}()
-
-	// Block main goroutine forever
-	//<-make(chan struct{})
 
 	startIndexingApi(*listen)
 
