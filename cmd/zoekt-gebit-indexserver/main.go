@@ -235,7 +235,7 @@ func watchRepoDirs(watcher *fsnotify.Watcher) {
 					log.Printf("push detected for repoDir: %v", repoDir)
 					markedForIndex[repoDir] = true
 					if !indexRunning[repoDir] {
-						log.Println("run index for repoDir:", repoDir)
+						log.Println("start index run for repoDir:", repoDir)
 						go indexRepo(repoDir)
 					} else {
 						log.Printf("index for repoDir %v already running, marked again", repoDir)
