@@ -47,7 +47,8 @@ const (
 )
 
 type indexRequest struct {
-	RepoDir string
+	RepoDir     string `json:"repoDir,omitempty"`
+	Incremental bool   `json:"incremental,optional"`
 }
 
 var (
@@ -131,8 +132,7 @@ func startIndexingApi(listen string) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --request POST \
-//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git"}' \
+//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git", "incremental":true}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -151,8 +151,13 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("received serveIndex request for repoDir: %v, incremental: %v", req.RepoDir, req.Incremental)
+
+	gitOpts := prepareGitOpts(req.RepoDir)
+	gitOpts.Incremental = req.Incremental
+
 	markedForIndex[req.RepoDir] = true
-	if err := indexRepo(req.RepoDir); err != nil {
+	if err := indexRepoWithGitOpts(req.RepoDir, gitOpts); err != nil {
 		respondWithError(w, err)
 		return
 	}
@@ -180,14 +185,7 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func indexRepo(repoDir string) error {
-	// create copy of global opts for this index run and set run-specific values
-	opts := globalBuildOpts
-	opts.RepositoryDescription.Name = gitRepos[repoDir]
-	gitOpts := globalGitOpts
-	gitOpts.RepoDir = repoDir
-	gitOpts.BuildOptions = opts
-
+func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
 	// mark index running for this repo, prevents additional go routine starts
 	indexRunning[repoDir] = true
 
@@ -204,6 +202,21 @@ func indexRepo(repoDir string) error {
 	}
 	indexRunning[repoDir] = false
 	return nil
+}
+
+// create copy of global opts for this index run and set run-specific values
+func prepareGitOpts(repoDir string) gitindex.Options {
+	opts := globalBuildOpts
+	opts.RepositoryDescription.Name = gitRepos[repoDir]
+	gitOpts := globalGitOpts
+	gitOpts.RepoDir = repoDir
+	gitOpts.BuildOptions = opts
+
+	return gitOpts
+}
+
+func indexRepo(repoDir string) error {
+	return indexRepoWithGitOpts(repoDir, prepareGitOpts(repoDir))
 }
 
 func watchRepoDirs(watcher *fsnotify.Watcher) {
