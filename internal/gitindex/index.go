@@ -454,6 +454,7 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 	}
 
 	if opts.Incremental && opts.BuildOptions.IncrementalSkipIndexing() {
+		log.Println("incremental is true and index is up-to-date, nothing to do")
 		return false, nil
 	}
 
