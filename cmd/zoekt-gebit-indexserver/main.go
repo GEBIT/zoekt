@@ -48,7 +48,7 @@ const (
 
 type indexRequest struct {
 	RepoDir     string `json:"repoDir,omitempty"`
-	Incremental bool   `json:"incremental,optional"`
+	Incremental bool   `json:"incremental,omitempty"`
 }
 
 var (
