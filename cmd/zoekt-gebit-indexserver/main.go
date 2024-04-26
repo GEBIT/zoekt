@@ -102,7 +102,6 @@ func deleteOrphanIndexes(indexDir string) {
 
 	expr := indexDir + "/*"
 	for {
-		log.Print("start orphan check")
 		fs, err := filepath.Glob(expr)
 		if err != nil {
 			log.Printf("Glob(%q): %v", expr, err)
@@ -124,7 +123,6 @@ func deleteOrphanIndexes(indexDir string) {
 func startIndexingApi(listen string) {
 	http.HandleFunc("/index", serveIndex)
 
-	log.Printf("start api server on: %v", listen)
 	if err := http.ListenAndServe(listen, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -190,7 +188,10 @@ func indexRepo(repoDir string) error {
 	gitOpts.RepoDir = repoDir
 	gitOpts.BuildOptions = opts
 
+	// mark index running for this repo, prevents additional go routine starts
 	indexRunning[repoDir] = true
+
+	// run while markedForIndex is true, might get set again by a fs event
 	for markedForIndex[repoDir] {
 		markedForIndex[repoDir] = false
 		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
@@ -237,11 +238,12 @@ func watchRepoDirs(watcher *fsnotify.Watcher) {
 	}
 }
 
+// preiodically refresh watches to catch repos that were
+// deleted and then created again
 func refreshWatches(watcher *fsnotify.Watcher) {
 	t := time.NewTicker(time.Second * WATCH_REFRESH_PERIOD_S)
 
 	for {
-		log.Println("start refreshWatches")
 		for repoDir := range gitRepos {
 			watcher.Remove(repoDir)
 			watcher.Add(repoDir)
@@ -285,6 +287,7 @@ func run() int {
 			log.Fatal("could not start CPU profile: ", err)
 		}
 		defer pprof.StopCPUProfile()
+		log.Println("cpuprofile created")
 	}
 
 	if *repoCacheDir != "" {
@@ -301,11 +304,21 @@ func run() int {
 	globalBuildOpts.DocumentRanksPath = *offlineRanking
 	globalBuildOpts.DocumentRanksVersion = *offlineRankingVersion
 	globalBuildOpts.IndexDir = *indexDir
+	globalBuildOpts.LanguageMap = make(ctags.LanguageMap)
+	for _, mapping := range strings.Split(*languageMap, ",") {
+		m := strings.Split(mapping, ":")
+		if len(m) != 2 {
+			continue
+		}
+		globalBuildOpts.LanguageMap[m[0]] = ctags.StringToParser(m[1])
+	}
+	log.Println("globalBuildOpts set")
 
 	var branches []string
 	if *branchesStr != "" {
 		branches = strings.Split(*branchesStr, ",")
 	}
+	log.Println("branches set")
 
 	for _, repoDir := range flag.Args() {
 		repoDir, err := filepath.Abs(repoDir)
@@ -325,16 +338,6 @@ func run() int {
 	}
 	log.Println("gitRepos set")
 
-	globalBuildOpts.LanguageMap = make(ctags.LanguageMap)
-	for _, mapping := range strings.Split(*languageMap, ",") {
-		m := strings.Split(mapping, ":")
-		if len(m) != 2 {
-			continue
-		}
-		globalBuildOpts.LanguageMap[m[0]] = ctags.StringToParser(m[1])
-	}
-	log.Println("LanguageMap set")
-
 	globalGitOpts = gitindex.Options{
 		BranchPrefix:                      *branchPrefix,
 		Incremental:                       *incremental,
@@ -346,9 +349,9 @@ func run() int {
 		RepoDir:                           "",
 		DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
 	}
+	log.Println("globalGitOpts set")
 
 	go deleteOrphanIndexes(*indexDir)
-
 	log.Println("deleteOrphanIndexes started")
 
 	watcher, err := fsnotify.NewWatcher()
@@ -358,9 +361,12 @@ func run() int {
 	defer watcher.Close()
 
 	// start watches before inital index, so we catch pushes that happen
-	// during it
+	// during the initial index
 	go refreshWatches(watcher)
+	log.Println("refreshWatches started")
+
 	go watchRepoDirs(watcher)
+	log.Println("watchRepoDirs started")
 
 	// initial index run
 	exitStatus := 0
@@ -371,6 +377,7 @@ func run() int {
 		}
 	}
 
+	log.Printf("indexingApi starting on: %v", *listen)
 	startIndexingApi(*listen)
 
 	return exitStatus
