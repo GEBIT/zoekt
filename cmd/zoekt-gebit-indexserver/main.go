@@ -20,13 +20,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/automaxprocs/maxprocs"
@@ -48,15 +51,17 @@ const (
 
 type indexRequest struct {
 	RepoDir     string `json:"repoDir,omitempty"`
-	Incremental bool   `json:"incremental,omitempty"`
 }
 
 var (
-	markedForIndex  = map[string]bool{}
-	indexRunning    = map[string]bool{}
-	gitRepos        = map[string]string{}
-	globalGitOpts   gitindex.Options
-	globalBuildOpts build.Options
+	markedForIndex    = map[string]bool{}
+	indexRunning      = map[string]bool{}
+	gitRepos          = map[string]string{}
+	gitReposMutex     sync.Mutex
+	globalGitOpts     gitindex.Options
+	globalBuildOpts   build.Options
+	globalWatcher     *fsnotify.Watcher
+	globalRootRepoDir string
 )
 
 /////////////////////////////////////////////////////////////////////
@@ -123,6 +128,8 @@ func deleteOrphanIndexes(indexDir string) {
 
 func startIndexingApi(listen string) {
 	http.HandleFunc("/index", serveIndex)
+	http.HandleFunc("/reload-repos", serveReloadRepos)
+	http.HandleFunc("/list-repos", serveListRepos)
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
 		log.Fatal(err)
@@ -132,7 +139,82 @@ func startIndexingApi(listen string) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git", "incremental":true}' \
+//	  http://localhost:6060/list-repos
+func serveListRepos(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		respondWithError(w, errors.New("http method must be GET"))
+		return
+	}
+
+	gitReposMutex.Lock()
+	repoDirs := make([]string, 0, len(gitRepos))
+	for k, _ := range gitRepos {
+		repoDirs = append(repoDirs, k)
+	}
+	gitReposMutex.Unlock()
+
+	sort.Strings(repoDirs)
+	response := map[string]any{
+		"Success": true,
+		"RepoDirs": repoDirs,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// example curl:
+//
+//	curl -X POST --header "Content-Type: application/json" \
+//	  http://localhost:6060/reload-repos
+func serveReloadRepos(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondWithError(w, errors.New("http method must be POST"))
+		return
+	}
+
+	log.Println("ReloadRepos started")
+	gitReposMutex.Lock()
+
+	// clean gitRepos map
+	gitRepos = map[string]string{}
+
+	// add git repos again by file walking
+	err := filepath.Walk(globalRootRepoDir, addGitRepos)
+	if err != nil {
+		log.Println(err)
+	}
+
+	// create new watcher
+	newGlobalWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	// watch repos with new watcher
+	go watchRepoDirs(newGlobalWatcher)
+	
+	// swap global watcher, also closing the old watcher
+	oldGlobalWatcher := globalWatcher
+	globalWatcher = newGlobalWatcher
+	oldGlobalWatcher.Close()
+	
+	gitReposMutex.Unlock()
+	log.Println("ReloadRepos finished")
+
+	response := map[string]any{
+		"Success": true,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// example curl:
+//
+//	curl --header "Content-Type: application/json" \
+//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git"}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -151,10 +233,9 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("received serveIndex request for repoDir: %v, incremental: %v", req.RepoDir, req.Incremental)
+	log.Printf("received serveIndex request for repoDir: %v", req.RepoDir)
 
 	gitOpts := prepareGitOpts(req.RepoDir)
-	gitOpts.Incremental = req.Incremental
 
 	markedForIndex[req.RepoDir] = true
 	if err := indexRepoWithGitOpts(req.RepoDir, gitOpts); err != nil {
@@ -195,7 +276,7 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
 		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
 		err := gitindex.IndexGitRepo(gitOpts)
 		if err != nil {
-			log.Printf("indexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
+			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
 			indexRunning[repoDir] = false
 			return err
 		}
@@ -226,11 +307,11 @@ func watchRepoDirs(watcher *fsnotify.Watcher) {
 			if !ok {
 				return
 			}
-			log.Println("watcher event:", event)
+			// log.Println("watcher event:", event)
 			if event.Has(fsnotify.Remove) {
 				repoFile := filepath.Base(event.Name)
 				repoDir := filepath.Dir(event.Name)
-				log.Println("removed file:", repoFile)
+				// log.Println("removed file:", repoFile)
 				if repoFile == "HEAD.lock" {
 					log.Printf("push detected for repoDir: %v", repoDir)
 					markedForIndex[repoDir] = true
@@ -251,18 +332,55 @@ func watchRepoDirs(watcher *fsnotify.Watcher) {
 	}
 }
 
-// preiodically refresh watches to catch repos that were
+// periodically refresh watches to catch repos that were
 // deleted and then created again
-func refreshWatches(watcher *fsnotify.Watcher) {
+func refreshWatches() {
 	t := time.NewTicker(time.Second * WATCH_REFRESH_PERIOD_S)
 
 	for {
-		for repoDir := range gitRepos {
-			watcher.Remove(repoDir)
-			watcher.Add(repoDir)
-		}
+		gitReposMutex.Lock()
+		refreshAllWatches(globalWatcher)
+		gitReposMutex.Unlock()
 		<-t.C
 	}
+}
+
+func refreshAllWatches(watcher *fsnotify.Watcher) {
+	for repoDir := range gitRepos {
+		watcher.Remove(repoDir)
+		watcher.Add(repoDir)
+	}
+}
+
+func sanitizeRepoDir(repoDir string) string {
+	repoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filepath.Clean(repoDir)
+}
+
+func addGitRepo(repoDir string, repoCacheDir string) {
+	repoDir = sanitizeRepoDir(repoDir)
+
+	name := strings.TrimSuffix(repoDir, "/.git")
+	if repoCacheDir != "" && strings.HasPrefix(name, repoCacheDir) {
+		name = strings.TrimPrefix(name, repoCacheDir+"/")
+		name = strings.TrimSuffix(name, ".git")
+	} else {
+		name = strings.TrimSuffix(filepath.Base(name), ".git")
+	}
+	gitRepos[repoDir] = name
+}
+
+func addGitRepos(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if ! info.IsDir() {
+		addGitRepo(path, globalGitOpts.RepoCacheDir)
+	}
+	return nil
 }
 
 func run() int {
@@ -284,6 +402,7 @@ func run() int {
 	languageMap := flag.String("language_map", "", "a mapping between a language and its ctags processor (a:0,b:3).")
 	indexDir := flag.String("index_dir", "", "directory holding index shards. Defaults to $data_dir/index/")
 	listen := flag.String("listen", ":6060", "listen on this address.")
+	rootRepoDir := flag.String("root_repo_dir", "/r", "path to the root directory of all repos")
 	flag.Parse()
 
 	log.Println("flags parsed")
@@ -333,24 +452,6 @@ func run() int {
 	}
 	log.Println("branches set")
 
-	for _, repoDir := range flag.Args() {
-		repoDir, err := filepath.Abs(repoDir)
-		if err != nil {
-			log.Fatal(err)
-		}
-		repoDir = filepath.Clean(repoDir)
-
-		name := strings.TrimSuffix(repoDir, "/.git")
-		if *repoCacheDir != "" && strings.HasPrefix(name, *repoCacheDir) {
-			name = strings.TrimPrefix(name, *repoCacheDir+"/")
-			name = strings.TrimSuffix(name, ".git")
-		} else {
-			name = strings.TrimSuffix(filepath.Base(name), ".git")
-		}
-		gitRepos[repoDir] = name
-	}
-	log.Println("gitRepos set")
-
 	globalGitOpts = gitindex.Options{
 		BranchPrefix:                      *branchPrefix,
 		Incremental:                       *incremental,
@@ -364,21 +465,31 @@ func run() int {
 	}
 	log.Println("globalGitOpts set")
 
+	globalRootRepoDir = *rootRepoDir
+	// set initial gitRepos by walking the root repo file tree
+	err := filepath.Walk(globalRootRepoDir, addGitRepos)
+	if err != nil {
+		log.Println(err)
+		return 1
+	}
+
+	log.Println("gitRepos set")
+
 	go deleteOrphanIndexes(*indexDir)
 	log.Println("deleteOrphanIndexes started")
 
-	watcher, err := fsnotify.NewWatcher()
+	globalWatcher, err = fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer watcher.Close()
+	defer globalWatcher.Close()
 
 	// start watches before inital index, so we catch pushes that happen
 	// during the initial index
-	go refreshWatches(watcher)
+	go refreshWatches()
 	log.Println("refreshWatches started")
 
-	go watchRepoDirs(watcher)
+	go watchRepoDirs(globalWatcher)
 	log.Println("watchRepoDirs started")
 
 	// initial index run
