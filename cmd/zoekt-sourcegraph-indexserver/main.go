@@ -89,6 +89,15 @@ var (
 		"name",  // name of the repository that was indexed
 	})
 
+	metricIndexingDelay = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "index_indexing_delay_seconds",
+		Help:    "A histogram of durations from when an index job is added to the queue, to the time it completes.",
+		Buckets: prometheus.ExponentialBuckets(60, 2, 12), // 1m -> ~3 days
+	}, []string{
+		"state", // state is an indexState
+		"name",  // the name of the repository that was indexed
+	})
+
 	metricFetchDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "index_fetch_seconds",
 		Help:    "A histogram of latencies for fetching a repository.",
@@ -400,12 +409,13 @@ func (s *Server) processQueue() {
 			continue
 		}
 
-		opts, ok := s.queue.Pop()
+		item, ok := s.queue.Pop()
 		if !ok {
 			time.Sleep(time.Second)
 			continue
 		}
 
+		opts := item.Opts
 		args := s.indexArgs(opts)
 
 		ran := s.muIndexDir.With(opts.Name, func() {
@@ -416,8 +426,10 @@ func (s *Server) processQueue() {
 			state, err := s.Index(args)
 
 			elapsed := time.Since(start)
-
 			metricIndexDuration.WithLabelValues(string(state), repoNameForMetric(opts.Name)).Observe(elapsed.Seconds())
+
+			indexDelay := time.Since(item.DateAddedToQueue)
+			metricIndexingDelay.WithLabelValues(string(state), repoNameForMetric(opts.Name)).Observe(indexDelay.Seconds())
 
 			if err != nil {
 				log.Printf("error indexing %s: %s", args.String(), err)
@@ -434,6 +446,7 @@ func (s *Server) processQueue() {
 					sglog.Uint32("id", args.RepoID),
 					sglog.Strings("branches", branches),
 					sglog.Duration("duration", elapsed),
+					sglog.Duration("index_delay", indexDelay),
 				)
 			case indexStateSuccessMeta:
 				log.Printf("updated meta %s in %v", args.String(), elapsed)
@@ -645,6 +658,8 @@ func (s *Server) indexArgs(opts IndexOptions) *indexArgs {
 
 		// 1 MB; match https://sourcegraph.sgdev.org/github.com/sourcegraph/sourcegraph/-/blob/cmd/symbols/internal/symbols/search.go#L22
 		FileLimit: 1 << 20,
+
+		ShardMerging: s.shardMerging,
 	}
 }
 
@@ -1065,6 +1080,18 @@ func srcLogLevelIsDebug() bool {
 	return strings.EqualFold(lvl, "dbug") || strings.EqualFold(lvl, "debug")
 }
 
+func getEnvWithDefaultBool(k string, defaultVal bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return defaultVal
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Fatalf("error parsing ENV %s to int64: %s", k, err)
+	}
+	return b
+}
+
 func getEnvWithDefaultInt64(k string, defaultVal int64) int64 {
 	v := os.Getenv(k)
 	if v == "" {
@@ -1196,12 +1223,12 @@ type rootConfig struct {
 	blockProfileRate int
 
 	// config values related to shard merging
-	vacuumInterval time.Duration
-	mergeInterval  time.Duration
-	targetSize     int64
-	minSize        int64
-	minAgeDays     int
-	maxPriority    float64
+	disableShardMerging bool
+	vacuumInterval      time.Duration
+	mergeInterval       time.Duration
+	targetSize          int64
+	minSize             int64
+	minAgeDays          int
 
 	// config values related to backoff indexing repos with one or more consecutive failures
 	backoffDuration    time.Duration
@@ -1221,12 +1248,12 @@ func (rc *rootConfig) registerRootFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&rc.maxBackoffDuration, "max_backoff_duration", getEnvWithDefaultDuration("MAX_BACKOFF_DURATION", 120*time.Minute), "the maximum duration to backoff from enqueueing a repo for indexing.  A negative value disables indexing backoff.")
 
 	// flags related to shard merging
+	fs.BoolVar(&rc.disableShardMerging, "shard_merging", getEnvWithDefaultBool("SRC_DISABLE_SHARD_MERGING", false), "disable shard merging")
 	fs.DurationVar(&rc.vacuumInterval, "vacuum_interval", getEnvWithDefaultDuration("SRC_VACUUM_INTERVAL", 24*time.Hour), "run vacuum this often")
 	fs.DurationVar(&rc.mergeInterval, "merge_interval", getEnvWithDefaultDuration("SRC_MERGE_INTERVAL", 8*time.Hour), "run merge this often")
 	fs.Int64Var(&rc.targetSize, "merge_target_size", getEnvWithDefaultInt64("SRC_MERGE_TARGET_SIZE", 2000), "the target size of compound shards in MiB")
 	fs.Int64Var(&rc.minSize, "merge_min_size", getEnvWithDefaultInt64("SRC_MERGE_MIN_SIZE", 1800), "the minimum size of a compound shard in MiB")
 	fs.IntVar(&rc.minAgeDays, "merge_min_age", getEnvWithDefaultInt("SRC_MERGE_MIN_AGE", 7), "the time since the last commit in days. Shards with newer commits are excluded from merging.")
-	fs.Float64Var(&rc.maxPriority, "merge_max_priority", getEnvWithDefaultFloat64("SRC_MERGE_MAX_PRIORITY", 100), "the maximum priority a shard can have to be considered for merging.")
 }
 
 func startServer(conf rootConfig) error {
@@ -1428,7 +1455,7 @@ func newServer(conf rootConfig) (*Server, error) {
 		Interval:                          conf.interval,
 		CPUCount:                          cpuCount,
 		queue:                             *q,
-		shardMerging:                      zoekt.ShardMergingEnabled(),
+		shardMerging:                      !conf.disableShardMerging,
 		deltaBuildRepositoriesAllowList:   deltaBuildRepositoriesAllowList,
 		deltaShardNumberFallbackThreshold: deltaShardNumberFallbackThreshold,
 		repositoriesSkipSymbolsCalculationAllowList: reposShouldSkipSymbolsCalculation,
@@ -1439,7 +1466,6 @@ func newServer(conf rootConfig) (*Server, error) {
 			targetSizeBytes: conf.targetSize * 1024 * 1024,
 			minSizeBytes:    conf.minSize * 1024 * 1024,
 			minAgeDays:      conf.minAgeDays,
-			maxPriority:     conf.maxPriority,
 		},
 		timeout: indexingTimeout,
 	}, err

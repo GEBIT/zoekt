@@ -42,6 +42,9 @@ func TestMinFrequencyNgramOffsets(t *testing.T) {
 	// worse, so what we do instead is just validate that what we get back is
 	// acceptable.
 	if err := quick.Check(func(s string, maxFreq uint16) bool {
+		// Ensure maximum frequency is nonzero so that random sampling will work
+		maxFreq = max(maxFreq, 1)
+
 		ngramOffs := splitNGrams([]byte(s))
 		if len(ngramOffs) == 0 {
 			return true
@@ -68,6 +71,37 @@ func TestMinFrequencyNgramOffsets(t *testing.T) {
 		slices.Sort(start)
 		slices.Sort(frequencies)
 		return reflect.DeepEqual(start, frequencies[:2])
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindSelectiveNGrams(t *testing.T) {
+	if err := quick.Check(func(s string, maxFreq uint16) bool {
+		// Ensure maximum frequency is nonzero so that random sampling will work
+		maxFreq = max(maxFreq, 1)
+
+		ngramOffs := splitNGrams([]byte(s))
+		if len(ngramOffs) == 0 {
+			return true
+		}
+
+		slices.SortFunc(ngramOffs, runeNgramOff.Compare)
+		indexMap := make([]int, len(ngramOffs))
+		for i, n := range ngramOffs {
+			indexMap[n.index] = i
+		}
+
+		frequencies := genFrequencies(ngramOffs, int(maxFreq))
+		x0, x1 := findSelectiveNgrams(ngramOffs, indexMap, frequencies)
+
+		if len(ngramOffs) <= 1 {
+			return true
+		}
+
+		// Just assert the invariant that x0 is before x1. This test mostly checks
+		// for out-of-bounds errors.
+		return x0.index < x1.index
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
