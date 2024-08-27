@@ -53,6 +53,10 @@ type indexRequest struct {
 	RepoDir     string `json:"repoDir,omitempty"`
 }
 
+type indexAllRequest struct {
+	Incremental bool `json:"incremental,omitempty"`
+}
+
 var (
 	markedForIndex    = map[string]bool{}
 	indexRunning      = map[string]bool{}
@@ -128,6 +132,7 @@ func deleteOrphanIndexes(indexDir string) {
 
 func startIndexingApi(listen string) {
 	http.HandleFunc("/index", serveIndex)
+	http.HandleFunc("/index-all", serveIndexAll)
 	http.HandleFunc("/reload-repos", serveReloadRepos)
 	http.HandleFunc("/list-repos", serveListRepos)
 
@@ -251,6 +256,38 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// example curl:
+//
+//	curl --header "Content-Type: application/json" \
+//	  --data '{"incremental":true}' \
+//	  http://localhost:6060/index-all
+func serveIndexAll(w http.ResponseWriter, r *http.Request) {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req indexAllRequest
+	err := dec.Decode(&req)
+	if err != nil {
+		log.Printf("Error decoding index request: %v", err)
+		http.Error(w, "JSON parser error", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("received serveIndexAll request with incremental: %v", req.Incremental)
+
+	exitStatus := indexAll(req.Incremental)
+	if exitStatus != 0 {
+		respondWithError(w, errors.New("error while running indexAll"))
+		return
+	}
+
+	response := map[string]any{
+		"Success": true,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 func respondWithError(w http.ResponseWriter, err error) {
 	responseCode := http.StatusInternalServerError
 
@@ -298,6 +335,21 @@ func prepareGitOpts(repoDir string) gitindex.Options {
 
 func indexRepo(repoDir string) error {
 	return indexRepoWithGitOpts(repoDir, prepareGitOpts(repoDir))
+}
+
+func indexAll(incremental bool) int {
+	exitStatus := 0
+	gitReposMutex.Lock()
+	for repoDir := range gitRepos {
+		markedForIndex[repoDir] = true
+		gitOpts := prepareGitOpts(repoDir)
+		gitOpts.Incremental = incremental
+		if err := indexRepoWithGitOpts(repoDir, gitOpts); err != nil {
+			exitStatus = 1
+		}
+	}
+	gitReposMutex.Unlock()
+	return exitStatus
 }
 
 func watchRepoDirs(watcher *fsnotify.Watcher) {
@@ -493,13 +545,7 @@ func run() int {
 	log.Println("watchRepoDirs started")
 
 	// initial index run
-	exitStatus := 0
-	for repoDir := range gitRepos {
-		markedForIndex[repoDir] = true
-		if err := indexRepo(repoDir); err != nil {
-			exitStatus = 1
-		}
-	}
+	exitStatus := indexAll(*incremental)
 
 	log.Printf("indexingApi starting on: %v", *listen)
 	startIndexingApi(*listen)
