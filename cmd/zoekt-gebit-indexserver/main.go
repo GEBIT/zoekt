@@ -311,7 +311,7 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
 	for markedForIndex[repoDir] {
 		markedForIndex[repoDir] = false
 		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
-		err := gitindex.IndexGitRepo(gitOpts)
+		_, err := gitindex.IndexGitRepo(gitOpts)
 		if err != nil {
 			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
 			indexRunning[repoDir] = false
