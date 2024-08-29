@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -39,8 +40,6 @@ import (
 	"github.com/sourcegraph/zoekt/cmd"
 	"github.com/sourcegraph/zoekt/ctags"
 	"github.com/sourcegraph/zoekt/gitindex"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 const (
@@ -64,7 +63,6 @@ var (
 	gitReposMutex     sync.Mutex
 	globalGitOpts     gitindex.Options
 	globalBuildOpts   build.Options
-	globalWatcher     *fsnotify.Watcher
 	globalRootRepoDir string
 )
 
@@ -187,24 +185,12 @@ func serveReloadRepos(w http.ResponseWriter, r *http.Request) {
 	// add git repos again by file walking
 	err := filepath.Walk(globalRootRepoDir, addGitRepos)
 	if err != nil {
+		gitReposMutex.Unlock()
 		log.Println(err)
-	}
-
-	// create new watcher
-	newGlobalWatcher, err := fsnotify.NewWatcher()
-	if err != nil {
 		respondWithError(w, err)
 		return
 	}
 
-	// watch repos with new watcher
-	go watchRepoDirs(newGlobalWatcher)
-	
-	// swap global watcher, also closing the old watcher
-	oldGlobalWatcher := globalWatcher
-	globalWatcher = newGlobalWatcher
-	oldGlobalWatcher.Close()
-	
 	gitReposMutex.Unlock()
 	log.Println("ReloadRepos finished")
 
@@ -232,9 +218,9 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := markedForIndex[req.RepoDir]
+	_, ok := gitRepos[req.RepoDir]
 	if !ok {
-		respondWithError(w, err)
+		respondWithError(w, fmt.Errorf("serveIndex for unknown repoDir: %v", req.RepoDir))
 		return
 	}
 
@@ -350,58 +336,6 @@ func indexAll(incremental bool) int {
 	}
 	gitReposMutex.Unlock()
 	return exitStatus
-}
-
-func watchRepoDirs(watcher *fsnotify.Watcher) {
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			// log.Println("watcher event:", event)
-			if event.Has(fsnotify.Remove) {
-				repoFile := filepath.Base(event.Name)
-				repoDir := filepath.Dir(event.Name)
-				// log.Println("removed file:", repoFile)
-				if repoFile == "HEAD.lock" {
-					log.Printf("push detected for repoDir: %v", repoDir)
-					markedForIndex[repoDir] = true
-					if !indexRunning[repoDir] {
-						log.Println("start index run for repoDir:", repoDir)
-						go indexRepo(repoDir)
-					} else {
-						log.Printf("index for repoDir %v already running, marked again", repoDir)
-					}
-				}
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Println("error:", err)
-		}
-	}
-}
-
-// periodically refresh watches to catch repos that were
-// deleted and then created again
-func refreshWatches() {
-	t := time.NewTicker(time.Second * WATCH_REFRESH_PERIOD_S)
-
-	for {
-		gitReposMutex.Lock()
-		refreshAllWatches(globalWatcher)
-		gitReposMutex.Unlock()
-		<-t.C
-	}
-}
-
-func refreshAllWatches(watcher *fsnotify.Watcher) {
-	for repoDir := range gitRepos {
-		watcher.Remove(repoDir)
-		watcher.Add(repoDir)
-	}
 }
 
 func sanitizeRepoDir(repoDir string) string {
@@ -529,20 +463,6 @@ func run() int {
 
 	go deleteOrphanIndexes(*indexDir)
 	log.Println("deleteOrphanIndexes started")
-
-	globalWatcher, err = fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer globalWatcher.Close()
-
-	// start watches before inital index, so we catch pushes that happen
-	// during the initial index
-	go refreshWatches()
-	log.Println("refreshWatches started")
-
-	go watchRepoDirs(globalWatcher)
-	log.Println("watchRepoDirs started")
 
 	// initial index run
 	exitStatus := indexAll(*incremental)
