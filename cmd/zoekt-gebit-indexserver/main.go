@@ -64,6 +64,7 @@ var (
 	globalGitOpts     gitindex.Options
 	globalBuildOpts   build.Options
 	globalRootRepoDir string
+	initialIndexFinished = false
 )
 
 /////////////////////////////////////////////////////////////////////
@@ -133,6 +134,7 @@ func startIndexingApi(listen string) error {
 	http.HandleFunc("/index-all", serveIndexAll)
 	http.HandleFunc("/reload-repos", serveReloadRepos)
 	http.HandleFunc("/list-repos", serveListRepos)
+	http.HandleFunc("/status", serveStatus)
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
 		log.Fatal(err)
@@ -140,6 +142,36 @@ func startIndexingApi(listen string) error {
 	}
 	return nil
 }
+
+// example curl:
+//
+//	curl --header "Content-Type: application/json" \
+//	  http://localhost:6060/status
+func serveStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		respondWithError(w, errors.New("http method must be GET"))
+		return
+	}
+
+	runningRepos := []string{}
+	for repoDir, isRunning := range indexRunning {
+		if isRunning {
+			runningRepos = append(runningRepos, repoDir)
+		}
+	}
+
+	sort.Strings(runningRepos)
+
+	response := map[string]any{
+		"Success": true,
+		"InitialIndexFinished": initialIndexFinished,
+		"RunningRepos": runningRepos,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 
 // example curl:
 //
@@ -337,7 +369,13 @@ func indexRepo(repoDir string) error {
 func indexAll(incremental bool) int {
 	exitStatus := 0
 	gitReposMutex.Lock()
-	for repoDir := range gitRepos {
+	repoDirs := make([]string, 0, len(gitRepos))
+	for k, _ := range gitRepos {
+		repoDirs = append(repoDirs, k)
+	}
+	sort.Strings(repoDirs)
+
+	for _, repoDir := range repoDirs {
 		markedForIndex[repoDir] = true
 		gitOpts := prepareGitOpts(repoDir)
 		gitOpts.Incremental = incremental
@@ -345,6 +383,7 @@ func indexAll(incremental bool) int {
 			exitStatus = 1
 		}
 	}
+	initialIndexFinished = true
 	gitReposMutex.Unlock()
 	return exitStatus
 }
