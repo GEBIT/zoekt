@@ -128,7 +128,7 @@ func deleteOrphanIndexes(indexDir string) {
 // *Index* and respondWithError ORIGINALLY TAKEN FROM cmd/zoekt-dynamic-indexserver/main.go
 /////////////////////////////////////////////////////////////////////
 
-func startIndexingApi(listen string) {
+func startIndexingApi(listen string) error {
 	http.HandleFunc("/index", serveIndex)
 	http.HandleFunc("/index-all", serveIndexAll)
 	http.HandleFunc("/reload-repos", serveReloadRepos)
@@ -136,7 +136,9 @@ func startIndexingApi(listen string) {
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
 		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 // example curl:
@@ -184,14 +186,13 @@ func serveReloadRepos(w http.ResponseWriter, r *http.Request) {
 
 	// add git repos again by file walking
 	err := filepath.Walk(globalRootRepoDir, addGitRepos)
+	gitReposMutex.Unlock()
 	if err != nil {
-		gitReposMutex.Unlock()
 		log.Println(err)
 		respondWithError(w, err)
 		return
 	}
 
-	gitReposMutex.Unlock()
 	log.Println("ReloadRepos finished")
 
 	response := map[string]any{
@@ -228,6 +229,11 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	gitOpts := prepareGitOpts(req.RepoDir)
 
+	_, ok = indexRunning[req.RepoDir]
+	if !ok  {
+		// ensure indexRunning exists
+		indexRunning[req.RepoDir] = false
+	}
 	markedForIndex[req.RepoDir] = true
 	if err := indexRepoWithGitOpts(req.RepoDir, gitOpts); err != nil {
 		respondWithError(w, err)
@@ -290,6 +296,11 @@ func respondWithError(w http.ResponseWriter, err error) {
 }
 
 func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
+	if indexRunning[repoDir] {
+		log.Printf("IndexGitRepo dir: %v, name %v already running, skip", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
+		return nil
+	}
+
 	// mark index running for this repo, prevents additional go routine starts
 	indexRunning[repoDir] = true
 
@@ -464,11 +475,15 @@ func run() int {
 	go deleteOrphanIndexes(*indexDir)
 	log.Println("deleteOrphanIndexes started")
 
-	// initial index run
-	exitStatus := indexAll(*incremental)
+	// initial index run in the background
+	go indexAll(*incremental)
 
 	log.Printf("indexingApi starting on: %v", *listen)
-	startIndexingApi(*listen)
+	err = startIndexingApi(*listen)
+	exitStatus := 0
+	if err != nil {
+		exitStatus = 1
+	}
 
 	return exitStatus
 }
