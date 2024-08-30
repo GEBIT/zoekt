@@ -278,21 +278,16 @@ func sanitizeRepoDir(repoDir string) string {
 	return filepath.Clean(repoDir)
 }
 
-func addGitRepo(repoDir string, gitRepos *[]string) {
-	repoDir = sanitizeRepoDir(repoDir)
-	*gitRepos = append(*gitRepos, repoDir)
-}
-
 func walkRootRepoDir(rootRepoDir string) []string {
 	gitRepos := []string{}
 
-	// set initial gitRepos by walking the root repo file tree
+	// get gitRepos by walking the root repo file tree
 	err := filepath.Walk(rootRepoDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
-			addGitRepo(path, &gitRepos)
+			gitRepos = append(gitRepos, sanitizeRepoDir(path))
 		}
 		return nil
 	})
