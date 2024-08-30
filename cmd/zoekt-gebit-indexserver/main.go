@@ -51,15 +51,11 @@ type indexRequest struct {
 	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
 }
 
-type indexAllRequest struct {
-	Incremental bool `json:"incremental,omitempty"`
-}
-
 var (
-	markedForIndex    = map[string]bool{}
-	indexRunning      = map[string]bool{}
-	globalGitOpts     gitindex.Options
-	globalBuildOpts   build.Options
+	markedForIndex       = map[string]bool{}
+	indexRunning         = map[string]bool{}
+	globalGitOpts        gitindex.Options
+	globalBuildOpts      build.Options
 	initialIndexFinished = false
 )
 
@@ -96,6 +92,15 @@ func deleteIfOrphan(fn string) error {
 	_, err = os.Stat(repo.Source)
 	if os.IsNotExist(err) {
 		log.Printf("deleting orphan shard %s; source %q not found", fn, repo.Source)
+		// cleanup maps to avoid mem leaks
+		_, ok := indexRunning[repo.Source]
+		if ok {
+			delete(indexRunning, repo.Source)
+		}
+		_, ok = markedForIndex[repo.Source]
+		if ok {
+			delete(markedForIndex, repo.Source)
+		}
 		return os.Remove(fn)
 	}
 
@@ -156,9 +161,9 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(runningRepos)
 
 	response := map[string]any{
-		"Success": true,
+		"Success":              true,
 		"InitialIndexFinished": initialIndexFinished,
-		"RunningRepos": runningRepos,
+		"RunningRepos":         runningRepos,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -189,7 +194,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	gitOpts := prepareGitOpts(repoDir)
 
 	_, ok := indexRunning[repoDir]
-	if !ok  {
+	if !ok {
 		// ensure indexRunning exists
 		indexRunning[repoDir] = false
 	}
@@ -221,10 +226,10 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
+func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 	if indexRunning[repoDir] {
 		log.Printf("IndexGitRepo dir: %v, name %v already running, skip", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
-		return nil
+		return
 	}
 
 	// mark index running for this repo, prevents additional go routine starts
@@ -237,12 +242,9 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
 		_, err := gitindex.IndexGitRepo(gitOpts)
 		if err != nil {
 			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
-			indexRunning[repoDir] = false
-			return err
 		}
 	}
 	indexRunning[repoDir] = false
-	return nil
 }
 
 // create copy of global opts for this index run and set run-specific values
@@ -256,24 +258,16 @@ func prepareGitOpts(repoDir string) gitindex.Options {
 	return gitOpts
 }
 
-func indexRepo(repoDir string) error {
-	return indexRepoWithGitOpts(repoDir, prepareGitOpts(repoDir))
-}
-
-func indexAll(incremental bool, rootRepoDir string) int {
-	exitStatus := 0
+func indexAll(incremental bool, rootRepoDir string) {
 	repoDirs := walkRootRepoDir(rootRepoDir)
 
 	for _, repoDir := range repoDirs {
-		markedForIndex[repoDir] = true
 		gitOpts := prepareGitOpts(repoDir)
 		gitOpts.Incremental = incremental
-		if err := indexRepoWithGitOpts(repoDir, gitOpts); err != nil {
-			exitStatus = 1
-		}
+		markedForIndex[repoDir] = true
+		indexRepoWithGitOpts(repoDir, gitOpts)
 	}
 	initialIndexFinished = true
-	return exitStatus
 }
 
 func sanitizeRepoDir(repoDir string) string {
@@ -293,11 +287,11 @@ func walkRootRepoDir(rootRepoDir string) []string {
 	gitRepos := []string{}
 
 	// set initial gitRepos by walking the root repo file tree
-	err := filepath.Walk(rootRepoDir, func (path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(rootRepoDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if ! info.IsDir() {
+		if !info.IsDir() {
 			addGitRepo(path, &gitRepos)
 		}
 		return nil
