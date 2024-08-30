@@ -30,7 +30,6 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/automaxprocs/maxprocs"
@@ -59,11 +58,8 @@ type indexAllRequest struct {
 var (
 	markedForIndex    = map[string]bool{}
 	indexRunning      = map[string]bool{}
-	gitRepos          = map[string]string{}
-	gitReposMutex     sync.Mutex
 	globalGitOpts     gitindex.Options
 	globalBuildOpts   build.Options
-	globalRootRepoDir string
 	initialIndexFinished = false
 )
 
@@ -131,9 +127,6 @@ func deleteOrphanIndexes(indexDir string) {
 
 func startIndexingApi(listen string) error {
 	http.HandleFunc("/index", serveIndex)
-	http.HandleFunc("/index-all", serveIndexAll)
-	http.HandleFunc("/reload-repos", serveReloadRepos)
-	http.HandleFunc("/list-repos", serveListRepos)
 	http.HandleFunc("/status", serveStatus)
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
@@ -172,73 +165,10 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  http://localhost:6060/list-repos
-func serveListRepos(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		respondWithError(w, errors.New("http method must be GET"))
-		return
-	}
-
-	gitReposMutex.Lock()
-	repoDirs := make([]string, 0, len(gitRepos))
-	for k, _ := range gitRepos {
-		repoDirs = append(repoDirs, k)
-	}
-	gitReposMutex.Unlock()
-
-	sort.Strings(repoDirs)
-	response := map[string]any{
-		"Success": true,
-		"RepoDirs": repoDirs,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// example curl:
-//
-//	curl -X POST --header "Content-Type: application/json" \
-//	  http://localhost:6060/reload-repos
-func serveReloadRepos(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondWithError(w, errors.New("http method must be POST"))
-		return
-	}
-
-	log.Println("ReloadRepos started")
-	gitReposMutex.Lock()
-
-	// clean gitRepos map
-	gitRepos = map[string]string{}
-
-	// add git repos again by file walking
-	err := filepath.Walk(globalRootRepoDir, addGitRepos)
-	gitReposMutex.Unlock()
-	if err != nil {
-		log.Println(err)
-		respondWithError(w, err)
-		return
-	}
-
-	log.Println("ReloadRepos finished")
-
-	response := map[string]any{
-		"Success": true,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// example curl:
-//
-//	curl --header "Content-Type: application/json" \
-//	  --data '{"repoDir":"/r/sparpos/sparpos-kassa.git"}' \
+//	  --data '{"ProjectPathWithNamespace":"sparpos/sparpos-kassa"}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -254,58 +184,19 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	// calculate repo dir from project path
 	repoDir := fmt.Sprintf("/r/%s.git", req.ProjectPathWithNamespace)
 
-	_, ok := gitRepos[repoDir]
-	if !ok {
-		respondWithError(w, fmt.Errorf("serveIndex for unknown repoDir: %v", repoDir))
-		return
-	}
-
 	log.Printf("received serveIndex request for repoDir: %v", repoDir)
 
 	gitOpts := prepareGitOpts(repoDir)
 
-	_, ok = indexRunning[repoDir]
+	_, ok := indexRunning[repoDir]
 	if !ok  {
 		// ensure indexRunning exists
 		indexRunning[repoDir] = false
 	}
 	markedForIndex[repoDir] = true
-	if err := indexRepoWithGitOpts(repoDir, gitOpts); err != nil {
-		respondWithError(w, err)
-		return
-	}
+	go indexRepoWithGitOpts(repoDir, gitOpts)
 
-	response := map[string]any{
-		"Success": true,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// example curl:
-//
-//	curl --header "Content-Type: application/json" \
-//	  --data '{"incremental":true}' \
-//	  http://localhost:6060/index-all
-func serveIndexAll(w http.ResponseWriter, r *http.Request) {
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var req indexAllRequest
-	err := dec.Decode(&req)
-	if err != nil {
-		log.Printf("Error decoding index request: %v", err)
-		http.Error(w, "JSON parser error", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("received serveIndexAll request with incremental: %v", req.Incremental)
-
-	exitStatus := indexAll(req.Incremental)
-	if exitStatus != 0 {
-		respondWithError(w, errors.New("error while running indexAll"))
-		return
-	}
+	log.Printf("started index for serveIndex request for repoDir: %v", repoDir)
 
 	response := map[string]any{
 		"Success": true,
@@ -357,7 +248,7 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) error {
 // create copy of global opts for this index run and set run-specific values
 func prepareGitOpts(repoDir string) gitindex.Options {
 	opts := globalBuildOpts
-	opts.RepositoryDescription.Name = gitRepos[repoDir]
+	opts.RepositoryDescription.Name = strings.TrimSuffix(strings.TrimPrefix(repoDir, "/r/"), ".git")
 	gitOpts := globalGitOpts
 	gitOpts.RepoDir = repoDir
 	gitOpts.BuildOptions = opts
@@ -369,14 +260,9 @@ func indexRepo(repoDir string) error {
 	return indexRepoWithGitOpts(repoDir, prepareGitOpts(repoDir))
 }
 
-func indexAll(incremental bool) int {
+func indexAll(incremental bool, rootRepoDir string) int {
 	exitStatus := 0
-	gitReposMutex.Lock()
-	repoDirs := make([]string, 0, len(gitRepos))
-	for k, _ := range gitRepos {
-		repoDirs = append(repoDirs, k)
-	}
-	sort.Strings(repoDirs)
+	repoDirs := walkRootRepoDir(rootRepoDir)
 
 	for _, repoDir := range repoDirs {
 		markedForIndex[repoDir] = true
@@ -387,7 +273,6 @@ func indexAll(incremental bool) int {
 		}
 	}
 	initialIndexFinished = true
-	gitReposMutex.Unlock()
 	return exitStatus
 }
 
@@ -399,27 +284,32 @@ func sanitizeRepoDir(repoDir string) string {
 	return filepath.Clean(repoDir)
 }
 
-func addGitRepo(repoDir string, repoCacheDir string) {
+func addGitRepo(repoDir string, gitRepos *[]string) {
 	repoDir = sanitizeRepoDir(repoDir)
-
-	name := strings.TrimSuffix(repoDir, "/.git")
-	if repoCacheDir != "" && strings.HasPrefix(name, repoCacheDir) {
-		name = strings.TrimPrefix(name, repoCacheDir+"/")
-		name = strings.TrimSuffix(name, ".git")
-	} else {
-		name = strings.TrimSuffix(filepath.Base(name), ".git")
-	}
-	gitRepos[repoDir] = name
+	*gitRepos = append(*gitRepos, repoDir)
 }
 
-func addGitRepos(path string, info os.FileInfo, err error) error {
+func walkRootRepoDir(rootRepoDir string) []string {
+	gitRepos := []string{}
+
+	// set initial gitRepos by walking the root repo file tree
+	err := filepath.Walk(rootRepoDir, func (path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if ! info.IsDir() {
+			addGitRepo(path, &gitRepos)
+		}
+		return nil
+	})
 	if err != nil {
-		return err
+		log.Println(err)
+		return nil
 	}
-	if ! info.IsDir() {
-		addGitRepo(path, globalGitOpts.RepoCacheDir)
-	}
-	return nil
+
+	sort.Strings(gitRepos)
+
+	return gitRepos
 }
 
 func run() int {
@@ -504,24 +394,14 @@ func run() int {
 	}
 	log.Println("globalGitOpts set")
 
-	globalRootRepoDir = *rootRepoDir
-	// set initial gitRepos by walking the root repo file tree
-	err := filepath.Walk(globalRootRepoDir, addGitRepos)
-	if err != nil {
-		log.Println(err)
-		return 1
-	}
-
-	log.Println("gitRepos set")
-
 	go deleteOrphanIndexes(*indexDir)
 	log.Println("deleteOrphanIndexes started")
 
 	// initial index run in the background
-	go indexAll(*incremental)
+	go indexAll(*incremental, *rootRepoDir)
 
 	log.Printf("indexingApi starting on: %v", *listen)
-	err = startIndexingApi(*listen)
+	err := startIndexingApi(*listen)
 	exitStatus := 0
 	if err != nil {
 		exitStatus = 1
