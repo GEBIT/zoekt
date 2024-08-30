@@ -702,6 +702,9 @@ func prepareDeltaBuild(options Options, repository *git.Repository) (repos map[f
 	for _, b := range options.Branches {
 		commit, err := getCommit(repository, options.BranchPrefix, b)
 		if err != nil {
+			if options.AllowMissingBranch {
+				continue
+			}
 			return nil, nil, nil, fmt.Errorf("getting last current commit for branch %q: %w", b, err)
 		}
 
