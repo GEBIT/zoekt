@@ -64,7 +64,6 @@ var (
 /////////////////////////////////////////////////////////////////////
 
 // Delete the shard if its corresponding git repo can't be found.
-
 func deleteIfOrphan(fn string) error {
 	f, err := os.Open(fn)
 	if err != nil {
@@ -235,7 +234,7 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 	// mark index running for this repo, prevents additional go routine starts
 	indexRunning[repoDir] = true
 
-	// run while markedForIndex is true, might get set again by a fs event
+	// run while markedForIndex is true, might get set again by a REST call
 	for markedForIndex[repoDir] {
 		markedForIndex[repoDir] = false
 		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
