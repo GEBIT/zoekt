@@ -49,7 +49,7 @@ const (
 )
 
 type indexRequest struct {
-	RepoDir     string `json:"repoDir,omitempty"`
+	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
 }
 
 type indexAllRequest struct {
@@ -251,23 +251,26 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := gitRepos[req.RepoDir]
+	// calculate repo dir from project path
+	repoDir := fmt.Sprintf("/r/%s.git", req.ProjectPathWithNamespace)
+
+	_, ok := gitRepos[repoDir]
 	if !ok {
-		respondWithError(w, fmt.Errorf("serveIndex for unknown repoDir: %v", req.RepoDir))
+		respondWithError(w, fmt.Errorf("serveIndex for unknown repoDir: %v", repoDir))
 		return
 	}
 
-	log.Printf("received serveIndex request for repoDir: %v", req.RepoDir)
+	log.Printf("received serveIndex request for repoDir: %v", repoDir)
 
-	gitOpts := prepareGitOpts(req.RepoDir)
+	gitOpts := prepareGitOpts(repoDir)
 
-	_, ok = indexRunning[req.RepoDir]
+	_, ok = indexRunning[repoDir]
 	if !ok  {
 		// ensure indexRunning exists
-		indexRunning[req.RepoDir] = false
+		indexRunning[repoDir] = false
 	}
-	markedForIndex[req.RepoDir] = true
-	if err := indexRepoWithGitOpts(req.RepoDir, gitOpts); err != nil {
+	markedForIndex[repoDir] = true
+	if err := indexRepoWithGitOpts(repoDir, gitOpts); err != nil {
 		respondWithError(w, err)
 		return
 	}
