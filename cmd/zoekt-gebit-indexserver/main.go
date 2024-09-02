@@ -42,9 +42,7 @@ import (
 )
 
 const (
-	INDEX_PERIOD_S         = 60
-	WATCH_REFRESH_PERIOD_S = 60
-	ORPHAN_CHECK_PERIOD_S  = 300
+	ORPHAN_CHECK_PERIOD_S = 300
 )
 
 type indexRequest struct {
@@ -52,10 +50,19 @@ type indexRequest struct {
 }
 
 var (
-	markedForIndex       = map[string]bool{}
-	indexRunning         = map[string]bool{}
-	globalGitOpts        gitindex.Options
-	globalBuildOpts      build.Options
+	// tracks which repoDirs should be indexed
+	markedForIndex = map[string]bool{}
+
+	// tracks for which repoDir an index operation is currently running
+	indexRunning = map[string]bool{}
+
+	// global copy of the gitOps to use when using multiple threads
+	globalGitOpts gitindex.Options
+
+	// global copy of the buildOpts to use when using multiple threads
+	globalBuildOpts build.Options
+
+	// tracks if the initial index run has finished
 	initialIndexFinished = false
 )
 
@@ -140,6 +147,8 @@ func startIndexingApi(listen string) error {
 	return nil
 }
 
+// Returns the current status of the indexer as json.
+//
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
@@ -169,6 +178,8 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// Requests an index operation of the given project.
+//
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
@@ -190,6 +201,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("received serveIndex request for repoDir: %v", repoDir)
 
+	// get copy of current gitOpts for new thread
 	gitOpts := prepareGitOpts(repoDir)
 
 	_, ok := indexRunning[repoDir]
@@ -197,10 +209,12 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		// ensure indexRunning exists
 		indexRunning[repoDir] = false
 	}
-	markedForIndex[repoDir] = true
-	go indexRepoWithGitOpts(repoDir, gitOpts)
 
-	log.Printf("started index for serveIndex request for repoDir: %v", repoDir)
+	// mark this repoDir as running
+	markedForIndex[repoDir] = true
+
+	// (try to) start new thread for index operation
+	go indexRepoWithGitOpts(repoDir, gitOpts)
 
 	response := map[string]any{
 		"Success": true,
@@ -210,6 +224,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// Writes an error response for a http request.
 func respondWithError(w http.ResponseWriter, err error) {
 	responseCode := http.StatusInternalServerError
 
@@ -225,6 +240,7 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// Indexes a given repoDir with the given gitOpts
 func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 	if indexRunning[repoDir] {
 		log.Printf("IndexGitRepo dir: %v, name %v already running, skip", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
@@ -243,6 +259,8 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
 		}
 	}
+
+	// index for this repoDir finished, track it
 	indexRunning[repoDir] = false
 }
 
@@ -257,6 +275,8 @@ func prepareGitOpts(repoDir string) gitindex.Options {
 	return gitOpts
 }
 
+// Gets all repoDirs by file-walking the root repo dir
+// and indexes each repoDir sequentially
 func indexAll(incremental bool, rootRepoDir string) {
 	repoDirs := walkRootRepoDir(rootRepoDir)
 
@@ -269,6 +289,7 @@ func indexAll(incremental bool, rootRepoDir string) {
 	initialIndexFinished = true
 }
 
+// Cleans up a given repoDir path.
 func sanitizeRepoDir(repoDir string) string {
 	repoDir, err := filepath.Abs(repoDir)
 	if err != nil {
@@ -277,6 +298,8 @@ func sanitizeRepoDir(repoDir string) string {
 	return filepath.Clean(repoDir)
 }
 
+// File-walks the root repo dir and collects all symlinks (non-directories).
+// Returns a string slice containting all found repoDirs (ordered lexically).
 func walkRootRepoDir(rootRepoDir string) []string {
 	gitRepos := []string{}
 
@@ -286,6 +309,7 @@ func walkRootRepoDir(rootRepoDir string) []string {
 			return err
 		}
 		if !info.IsDir() {
+			// this is not a directory (but a symlink), collect it
 			gitRepos = append(gitRepos, sanitizeRepoDir(path))
 		}
 		return nil
@@ -382,10 +406,11 @@ func run() int {
 	}
 	log.Println("globalGitOpts set")
 
+	log.Println("deleteOrphanIndexes starting")
 	go deleteOrphanIndexes(*indexDir)
-	log.Println("deleteOrphanIndexes started")
 
 	// initial index run in the background
+	log.Println("initialIndex starting")
 	go indexAll(*incremental, *rootRepoDir)
 
 	log.Printf("indexingApi starting on: %v", *listen)
