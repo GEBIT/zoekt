@@ -19,6 +19,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,11 +30,13 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"go.uber.org/automaxprocs/maxprocs"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/cmd"
@@ -42,11 +45,13 @@ import (
 )
 
 const (
-	ORPHAN_CHECK_PERIOD_S = 300
+	ORPHAN_CHECK_PERIOD_S  = 300
+	REPOSITORIES_BASE_PATH = "/var/lib/git/@hashed"
 )
 
 type indexRequest struct {
 	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
+	ProjectId                int    `json:"ProjectId,omitempty"`
 }
 
 var (
@@ -183,7 +188,7 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --data '{"ProjectPathWithNamespace":"sparpos/sparpos-kassa"}' \
+//	  --data '{"ProjectPathWithNamespace":"sparpos/sparpos-kassa", "ProjectId": 1234}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -196,13 +201,22 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// calculate repo dir from project path
-	repoDir := fmt.Sprintf("/r/%s.git", req.ProjectPathWithNamespace)
+	projectPathWithNamespace := req.ProjectPathWithNamespace
+	projectId := req.ProjectId
 
-	log.Printf("received serveIndex request for repoDir: %v", repoDir)
+	// get the sha256 of the projectId
+	h := sha256.New()
+	h.Write([]byte(strconv.Itoa(projectId)))
+	hexDigest := fmt.Sprintf("%x", h.Sum(nil))
+
+	// calculate repo dir from hexDigest of projecId
+	repoDir := fmt.Sprintf("%s/%s/%s/%s.git", REPOSITORIES_BASE_PATH, hexDigest[0:2], hexDigest[2:4], hexDigest)
+
+	log.Printf("received serveIndex request for projectPathWithNamespace: %v, projectId: %v, repoDir: %v",
+		projectPathWithNamespace, projectId, repoDir)
 
 	// get copy of current gitOpts for new thread
-	gitOpts := prepareGitOpts(repoDir)
+	gitOpts := prepareGitOpts(repoDir, projectPathWithNamespace)
 
 	_, ok := indexRunning[repoDir]
 	if !ok {
@@ -253,7 +267,7 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 	// run while markedForIndex is true, might get set again by a REST call
 	for markedForIndex[repoDir] {
 		markedForIndex[repoDir] = false
-		log.Printf("start IndexGitRepo dir: %v, name %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
+		log.Printf("start IndexGitRepo dir: %v, name: %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
 		_, err := gitindex.IndexGitRepo(gitOpts)
 		if err != nil {
 			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
@@ -265,9 +279,9 @@ func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 }
 
 // create copy of global opts for this index run and set run-specific values
-func prepareGitOpts(repoDir string) gitindex.Options {
+func prepareGitOpts(repoDir string, repoName string) gitindex.Options {
 	opts := globalBuildOpts
-	opts.RepositoryDescription.Name = strings.TrimSuffix(strings.TrimPrefix(repoDir, "/r/"), ".git")
+	opts.RepositoryDescription.Name = repoName
 	gitOpts := globalGitOpts
 	gitOpts.RepoDir = repoDir
 	gitOpts.BuildOptions = opts
@@ -281,7 +295,25 @@ func indexAll(incremental bool, rootRepoDir string) {
 	repoDirs := walkRootRepoDir(rootRepoDir)
 
 	for _, repoDir := range repoDirs {
-		gitOpts := prepareGitOpts(repoDir)
+		repo, err := git.PlainOpen(repoDir)
+		if err != nil {
+			log.Printf("error opening git repo: %v", err)
+			continue
+		}
+		repoConfig, err := repo.Config()
+		if err != nil {
+			log.Printf("error opening git config for repo: %v", err)
+			continue
+		}
+		gitlabSection := repoConfig.Raw.Section("gitlab")
+		repoName := gitlabSection.Options.Get("fullpath")
+		if len(repoName) == 0 {
+			// empty gitlab name, set hash as fallback for now
+			splitRepoDir := strings.Split(repoDir, "/")
+			repoName = strings.Replace(splitRepoDir[len(splitRepoDir)-1], ".git", "", -1)
+			log.Printf("No gitlab git config for repoDir: %v, falling back to hashed repoName: %v", repoDir, repoName)
+		}
+		gitOpts := prepareGitOpts(repoDir, repoName)
 		gitOpts.Incremental = incremental
 		markedForIndex[repoDir] = true
 		indexRepoWithGitOpts(repoDir, gitOpts)
@@ -303,13 +335,15 @@ func sanitizeRepoDir(repoDir string) string {
 func walkRootRepoDir(rootRepoDir string) []string {
 	gitRepos := []string{}
 
+	log.Printf("start walkRootRepoDir at dir: %v", rootRepoDir)
+
 	// get gitRepos by walking the root repo file tree
 	err := filepath.Walk(rootRepoDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			// this is not a directory (but a symlink), collect it
+		if info.IsDir() && strings.HasSuffix(path, ".git") {
+			// this is a directory ending in .git, collect it
 			gitRepos = append(gitRepos, sanitizeRepoDir(path))
 		}
 		return nil
@@ -343,7 +377,7 @@ func run() int {
 	languageMap := flag.String("language_map", "", "a mapping between a language and its ctags processor (a:0,b:3).")
 	indexDir := flag.String("index_dir", "", "directory holding index shards. Defaults to $data_dir/index/")
 	listen := flag.String("listen", ":6060", "listen on this address.")
-	rootRepoDir := flag.String("root_repo_dir", "/r", "path to the root directory of all repos")
+	rootRepoDir := flag.String("root_repo_dir", REPOSITORIES_BASE_PATH, "path to the root directory of all repos")
 	flag.Parse()
 
 	log.Println("flags parsed")
