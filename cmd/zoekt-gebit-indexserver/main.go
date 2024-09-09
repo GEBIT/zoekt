@@ -215,6 +215,34 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	log.Printf("received serveIndex request for projectPathWithNamespace: %v, projectId: %v, repoDir: %v",
 		projectPathWithNamespace, projectId, repoDir)
 
+	repo, err := git.PlainOpen(repoDir)
+	if err != nil {
+		log.Printf("error opening git repo: %v", err)
+		respondWithError(w, fmt.Errorf("error opening git repo: %v", err))
+		return
+	}
+	repoConfig, err := repo.Config()
+	if err != nil {
+		log.Printf("error opening git config for repo: %v", err)
+		respondWithError(w, fmt.Errorf("error opening git config for repo: %v", err))
+		return
+	}
+	// check if skipindex flag is set
+	zoektSection := repoConfig.Raw.Section("gebit")
+	skipIndex := zoektSection.Options.Get("skipIndex")
+	if skipIndex == "true" {
+		log.Printf("skipping index for repoDir %v", repoDir)
+
+		response := map[string]any{
+			"Success": true,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+
+		return
+	}
+
 	// get copy of current gitOpts for new thread
 	gitOpts := prepareGitOpts(repoDir, projectPathWithNamespace)
 
@@ -303,6 +331,13 @@ func indexAll(incremental bool, rootRepoDir string) {
 		repoConfig, err := repo.Config()
 		if err != nil {
 			log.Printf("error opening git config for repo: %v", err)
+			continue
+		}
+		// check if skipindex flag is set
+		zoektSection := repoConfig.Raw.Section("gebit")
+		skipIndex := zoektSection.Options.Get("skipIndex")
+		if skipIndex == "true" {
+			log.Printf("skipping index for repoDir %v", repoDir)
 			continue
 		}
 		gitlabSection := repoConfig.Raw.Section("gitlab")
