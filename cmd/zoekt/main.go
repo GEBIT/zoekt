@@ -191,7 +191,7 @@ func main() {
 	if *shard != "" {
 		searcher, err = loadShard(*shard, *verbose)
 	} else {
-		searcher, err = shards.NewDirectorySearcher(*index)
+		searcher, err = shards.NewDirectorySearcher(*index, "")
 	}
 
 	if err != nil {

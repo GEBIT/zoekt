@@ -926,6 +926,10 @@ const (
 type ListOptions struct {
 	// Field decides which field to populate in RepoList response.
 	Field RepoListField
+
+	// Username of the user running the query in the neogrok frontend.
+	// used for restricting the user to the repoACL
+	UserName string
 }
 
 func (o *ListOptions) GetField() (RepoListField, error) {
@@ -1015,6 +1019,10 @@ type SearchOptions struct {
 
 	// SpanContext is the opentracing span context, if it exists, from the zoekt client
 	SpanContext map[string]string
+
+	// Username of the user running the query in the neogrok frontend.
+	// used for restricting the user to the repoACL
+	UserName string
 }
 
 func (o *SearchOptions) SetDefaults() {

@@ -16,7 +16,9 @@ package shards
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -211,20 +213,37 @@ type shardedSearcher struct {
 
 	ready  atomic.Bool
 	ranked atomic.Value
+
+	// maps usernames to a list of repos they have access to
+	repoACL map[string][]string
 }
 
-func newShardedSearcher(n int64) *shardedSearcher {
+func newShardedSearcher(n int64, repoACLFile string) *shardedSearcher {
+	jsonFile, err := os.Open(repoACLFile)
+	if err != nil {
+		log.Printf("error opening repoACLFile: %v", repoACLFile)
+	}
+	defer jsonFile.Close()
+
+	repoACL := map[string][]string{}
+	byteValue, _ := io.ReadAll(jsonFile)
+	err = json.Unmarshal(byteValue, &repoACL)
+	if err != nil {
+		log.Printf("error unmarshaling repoACLFile: %v", repoACLFile)
+	}
+
 	ss := &shardedSearcher{
-		shards: make(map[string]*rankedShard),
-		sched:  newScheduler(n),
+		shards:  make(map[string]*rankedShard),
+		sched:   newScheduler(n),
+		repoACL: repoACL,
 	}
 	return ss
 }
 
 // NewDirectorySearcher returns a searcher instance that loads all
 // shards corresponding to a glob into memory.
-func NewDirectorySearcher(dir string) (zoekt.Streamer, error) {
-	return newDirectorySearcher(dir, true)
+func NewDirectorySearcher(dir string, repoAccessFile string) (zoekt.Streamer, error) {
+	return newDirectorySearcher(dir, true, repoAccessFile)
 }
 
 // NewDirectorySearcherFast is like NewDirectorySearcher, but does not block
@@ -233,12 +252,12 @@ func NewDirectorySearcher(dir string) (zoekt.Streamer, error) {
 // This exists since in the case of zoekt-webserver we are happy with having
 // partial availability since that is better than no availability on large
 // instances.
-func NewDirectorySearcherFast(dir string) (zoekt.Streamer, error) {
-	return newDirectorySearcher(dir, false)
+func NewDirectorySearcherFast(dir string, repoAccessFile string) (zoekt.Streamer, error) {
+	return newDirectorySearcher(dir, false, repoAccessFile)
 }
 
-func newDirectorySearcher(dir string, waitUntilReady bool) (zoekt.Streamer, error) {
-	ss := newShardedSearcher(int64(runtime.GOMAXPROCS(0)))
+func newDirectorySearcher(dir string, waitUntilReady bool, repoAccessFile string) (zoekt.Streamer, error) {
+	ss := newShardedSearcher(int64(runtime.GOMAXPROCS(0)), repoAccessFile)
 	tl := &loader{
 		ss: ss,
 	}
@@ -513,6 +532,30 @@ func doSelectRepoSet(shards []*rankedShard, and *query.And) ([]*rankedShard, que
 	return shards, and
 }
 
+func (ss *shardedSearcher) getAllowedShards(shards []*rankedShard, reposForUser []string) []*rankedShard {
+	var allowed bool
+	allowedShards := []*rankedShard{}
+	for _, shard := range shards {
+		allowed = true
+		numRepos := len(shard.repos)
+		if numRepos > 1 {
+			log.Printf("WARNING: more than 1 repo in shard %v", shard)
+		}
+		for _, repoPtr := range shard.repos {
+			repo := *repoPtr
+			if !slices.Contains(reposForUser, repo.Name) {
+				// disallowed shard, remove
+				allowed = false
+				break
+			}
+		}
+		if allowed {
+			allowedShards = append(allowedShards, shard)
+		}
+	}
+	return allowedShards
+}
+
 func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
 	tr, ctx := trace.New(ctx, "shardedSearcher.Search", "")
 	tr.LazyLog(q, true)
@@ -541,10 +584,74 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	defer proc.Release()
 	tr.LazyPrintf("acquired process")
 
+	/*
+		VARIANT 1: modify query, appending AND(OR(repo1, repo1))
+
+		// make sure we have an actual user query, not the watchdog query
+		if q.String() != "TRUE" {
+			// this is a user query
+
+			// passed by frontend
+			userName := opts.UserName
+			if userName == "" {
+				log.Printf("DENIED: userName is empty, query: %v", q)
+				return &zoekt.SearchResult{}, fmt.Errorf("DENIED: userName is empty for query: %v", q)
+			}
+
+			log.Printf("userName from opts: %v", userName)
+			reposForUser, ok := ss.repoAccess[userName]
+			if !ok {
+				log.Printf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+				return &zoekt.SearchResult{}, fmt.Errorf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+			}
+
+			repoQueriesForUser := []query.Q{}
+			for _, repo := range reposForUser {
+				r, err := regexp.Compile(repo)
+				if err != nil {
+					log.Printf("error compiling as regex: %v", repo)
+				}
+
+				repoQuery := &query.Repo{Regexp: r}
+				repoQueriesForUser = append(repoQueriesForUser, repoQuery)
+			}
+
+			repoOrs := query.NewOr(repoQueriesForUser...)
+
+			q = query.NewAnd(q, repoOrs)
+			log.Printf("modified query with repoACL")
+
+		}
+	*/
+
 	wait := time.Since(start)
 	start = time.Now()
 
 	loaded := ss.getLoaded()
+
+	// VARIANT 2: construct filtered list of loaded allowed shards and pass them to streamSearch()
+
+	// make sure we have an actual user query, not the watchdog query
+	if q.String() != "TRUE" {
+		// this is a user query
+
+		// passed by frontend
+		userName := opts.UserName
+		if userName == "" {
+			log.Printf("DENIED: userName is empty, query: %v", q)
+			return &zoekt.SearchResult{}, fmt.Errorf("DENIED: userName is empty for query: %v", q)
+		}
+
+		log.Printf("userName from opts: %v", userName)
+		reposForUser, ok := ss.repoACL[userName]
+		if !ok {
+			log.Printf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+			return &zoekt.SearchResult{}, fmt.Errorf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+		}
+
+		loaded.shards = ss.getAllowedShards(loaded.shards, reposForUser)
+	}
+
 	done, err := streamSearch(ctx, proc, q, opts, loaded.shards, collectSender)
 	defer done()
 	if err != nil {
@@ -959,6 +1066,21 @@ func (ss *shardedSearcher) List(ctx context.Context, q query.Q, opts *zoekt.List
 	tr.LazyPrintf("acquired process")
 
 	loaded := ss.getLoaded()
+
+	userName := opts.UserName
+	if userName == "" {
+		log.Printf("DENIED: userName is empty, query: %v", q)
+		return &zoekt.RepoList{}, fmt.Errorf("DENIED: userName is empty for query: %v", q)
+	}
+
+	log.Printf("userName from opts: %v", userName)
+	reposForUser, ok := ss.repoACL[userName]
+	if !ok {
+		log.Printf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+		return &zoekt.RepoList{}, fmt.Errorf("DENIED: userName %v is not in repoACL, query: %v", userName, q)
+	}
+	loaded.shards = ss.getAllowedShards(loaded.shards, reposForUser)
+
 	shards := loaded.shards
 
 	// Setup what we return now, since we may short circuit if there are no

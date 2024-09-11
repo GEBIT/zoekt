@@ -153,6 +153,7 @@ func main() {
 	templateDir := flag.String("template_dir", "", "set directory from which to load custom .html.tpl template files")
 	dumpTemplates := flag.Bool("dump_templates", false, "dump templates into --template_dir and exit.")
 	version := flag.Bool("version", false, "Print version number")
+	repoACLFile := flag.String("repo_acl_file", "", "set repo access list file, containing a map of users to a list of repos they have access to.")
 
 	flag.Parse()
 
@@ -210,7 +211,7 @@ func main() {
 	// Do not block on loading shards so we can become partially available
 	// sooner. Otherwise on large instances zoekt can be unavailable on the
 	// order of minutes.
-	searcher, err := shards.NewDirectorySearcherFast(*indexDir)
+	searcher, err := shards.NewDirectorySearcherFast(*indexDir, *repoACLFile)
 	if err != nil {
 		log.Fatal(err)
 	}
