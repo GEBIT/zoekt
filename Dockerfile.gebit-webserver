@@ -1,0 +1,14 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates bind-tools tini bash curl git
+
+# Run as non-root user sourcegraph. External volumes should be mounted under /data (which will be owned by sourcegraph).
+RUN mkdir -p /home/sourcegraph /zoekt
+RUN addgroup -g 998 -S sourcegraph && adduser -u 998 -S -G sourcegraph -h /home/sourcegraph sourcegraph && mkdir -p /zoekt && chown -R sourcegraph:sourcegraph /zoekt
+USER sourcegraph
+WORKDIR /zoekt
+
+VOLUME /zoekt/index
+EXPOSE 8080
+COPY --from=zoekt /usr/local/bin/zoekt-webserver /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/zoekt-webserver", "-index=/zoekt/index", "-html=false", "-rpc=true", "-repo_access_file=/zoekt/repo-access/repo-acl.json",  "-listen=:8080"]

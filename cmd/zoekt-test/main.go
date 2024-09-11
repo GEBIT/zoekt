@@ -107,7 +107,7 @@ func compare(dir, patfile string, caseSensitive bool) error {
 	if err != nil {
 		return err
 	}
-	searcher, err := shards.NewDirectorySearcher(indexDir)
+	searcher, err := shards.NewDirectorySearcher(indexDir, "")
 	if err != nil {
 		return err
 	}
@@ -179,7 +179,7 @@ func testLoadIndexDir(indexDir string) {
 	runtime.GC()
 	runtime.ReadMemStats(&a)
 	start := time.Now()
-	s, err := shards.NewDirectorySearcher(indexDir)
+	s, err := shards.NewDirectorySearcher(indexDir, "")
 	if err != nil {
 		return
 	}
