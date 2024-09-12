@@ -11,4 +11,4 @@ WORKDIR /zoekt
 VOLUME /zoekt/index
 EXPOSE 8080
 COPY --from=zoekt /usr/local/bin/zoekt-webserver /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/zoekt-webserver", "-index=/zoekt/index", "-html=false", "-rpc=true", "-repo_access_file=/zoekt/repo-access/repo-acl.json",  "-listen=:8080"]
+ENTRYPOINT ["/usr/local/bin/zoekt-webserver", "-index=/zoekt/index", "-html=false", "-rpc=true", "-repo_acl_file=/zoekt/lib/repo-acl.json", "-listen=:8080"]
