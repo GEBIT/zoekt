@@ -214,22 +214,24 @@ type shardedSearcher struct {
 	ready  atomic.Bool
 	ranked atomic.Value
 
-	// maps usernames to a list of repos they have access to
+	// Maps usernames to a list of repos they have access to
 	repoACL map[string][]string
 }
 
 func newShardedSearcher(n int64, repoACLFile string) *shardedSearcher {
-	jsonFile, err := os.Open(repoACLFile)
-	if err != nil {
-		log.Printf("error opening repoACLFile: %v", repoACLFile)
-	}
-	defer jsonFile.Close()
-
 	repoACL := map[string][]string{}
-	byteValue, _ := io.ReadAll(jsonFile)
-	err = json.Unmarshal(byteValue, &repoACL)
-	if err != nil {
-		log.Printf("error unmarshaling repoACLFile: %v", repoACLFile)
+	if repoACLFile != "" {
+		jsonFile, err := os.Open(repoACLFile)
+		if err != nil {
+			log.Printf("error opening repoACLFile: %v", repoACLFile)
+		}
+		defer jsonFile.Close()
+
+		byteValue, _ := io.ReadAll(jsonFile)
+		err = json.Unmarshal(byteValue, &repoACL)
+		if err != nil {
+			log.Printf("error unmarshaling repoACLFile: %v", repoACLFile)
+		}
 	}
 
 	ss := &shardedSearcher{
@@ -242,8 +244,8 @@ func newShardedSearcher(n int64, repoACLFile string) *shardedSearcher {
 
 // NewDirectorySearcher returns a searcher instance that loads all
 // shards corresponding to a glob into memory.
-func NewDirectorySearcher(dir string, repoAccessFile string) (zoekt.Streamer, error) {
-	return newDirectorySearcher(dir, true, repoAccessFile)
+func NewDirectorySearcher(dir string, repoACLFile string) (zoekt.Streamer, error) {
+	return newDirectorySearcher(dir, true, repoACLFile)
 }
 
 // NewDirectorySearcherFast is like NewDirectorySearcher, but does not block
@@ -252,12 +254,12 @@ func NewDirectorySearcher(dir string, repoAccessFile string) (zoekt.Streamer, er
 // This exists since in the case of zoekt-webserver we are happy with having
 // partial availability since that is better than no availability on large
 // instances.
-func NewDirectorySearcherFast(dir string, repoAccessFile string) (zoekt.Streamer, error) {
-	return newDirectorySearcher(dir, false, repoAccessFile)
+func NewDirectorySearcherFast(dir string, repoACLFile string) (zoekt.Streamer, error) {
+	return newDirectorySearcher(dir, false, repoACLFile)
 }
 
-func newDirectorySearcher(dir string, waitUntilReady bool, repoAccessFile string) (zoekt.Streamer, error) {
-	ss := newShardedSearcher(int64(runtime.GOMAXPROCS(0)), repoAccessFile)
+func newDirectorySearcher(dir string, waitUntilReady bool, repoACLFile string) (zoekt.Streamer, error) {
+	ss := newShardedSearcher(int64(runtime.GOMAXPROCS(0)), repoACLFile)
 	tl := &loader{
 		ss: ss,
 	}
