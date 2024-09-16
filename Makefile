@@ -1,5 +1,7 @@
 build: build-zoekt build-gebit-indexserver build-gebit-webserver
 
+push: push-gebit-indexserver push-gebit-webserver
+
 build-zoekt:
 	@docker build . -t zoekt
 
