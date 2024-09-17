@@ -188,7 +188,7 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --data '{"ProjectPathWithNamespace":"sparpos/sparpos-kassa", "ProjectId": 1234}' \
+//	  --data '{"ProjectPathWithNamespace":"group/project", "ProjectId": 1234}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
