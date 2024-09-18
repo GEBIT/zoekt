@@ -22,6 +22,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -32,6 +33,7 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/atomic"
@@ -210,31 +212,23 @@ type shardedSearcher struct {
 	ready  atomic.Bool
 	ranked atomic.Value
 
+	// Filepath containing the repoACL
+	repoACLFile string
 	// Maps usernames to a list of repos they have access to
 	repoACL map[string][]string
+	// file watcher for repoACLFile
+	repoACLFileWatcher *fsnotify.Watcher
 }
 
 func newShardedSearcher(n int64, repoACLFile string) *shardedSearcher {
-	repoACL := map[string][]string{}
-	if repoACLFile != "" {
-		jsonFile, err := os.Open(repoACLFile)
-		if err != nil {
-			log.Printf("error opening repoACLFile: %v", repoACLFile)
-		}
-		defer jsonFile.Close()
-
-		byteValue, _ := io.ReadAll(jsonFile)
-		err = json.Unmarshal(byteValue, &repoACL)
-		if err != nil {
-			log.Printf("error unmarshaling repoACLFile: %v", repoACLFile)
-		}
-	}
-
 	ss := &shardedSearcher{
-		shards:  make(map[string]*rankedShard),
-		sched:   newScheduler(n),
-		repoACL: repoACL,
+		shards:      make(map[string]*rankedShard),
+		sched:       newScheduler(n),
+		repoACLFile: repoACLFile,
 	}
+	ss.loadRepoACL()
+	ss.watchRepoACL()
+
 	return ss
 }
 
@@ -367,6 +361,63 @@ func (tl *loader) drop(keys ...string) {
 	tl.ss.replace(shards)
 }
 
+func (ss *shardedSearcher) loadRepoACL() {
+	repoACL := map[string][]string{}
+	if ss.repoACLFile != "" {
+		jsonFile, err := os.Open(ss.repoACLFile)
+		if err != nil {
+			log.Printf("error opening repoACLFile: %v", ss.repoACLFile)
+		}
+		defer jsonFile.Close()
+
+		byteValue, _ := io.ReadAll(jsonFile)
+		err = json.Unmarshal(byteValue, &repoACL)
+		if err != nil {
+			log.Printf("error unmarshaling repoACLFile: %v", ss.repoACLFile)
+		}
+	}
+	ss.repoACL = repoACL
+	log.Printf("loaded repo acl file: %v", ss.repoACLFile)
+}
+
+func (ss *shardedSearcher) watchRepoACL() {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("error creating new file watcher: %v", err)
+		return
+	}
+	ss.repoACLFileWatcher = w
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-w.Events:
+				if !ok {
+					return
+				}
+				if event.Name == ss.repoACLFile {
+					if event.Has(fsnotify.Create) {
+						// this is a create event for our repoACLFile, reload
+						ss.loadRepoACL()
+					}
+				}
+			case err, ok := <-w.Errors:
+				if !ok {
+					return
+				}
+				log.Println("error:", err)
+			}
+		}
+	}()
+
+	// watch dir of repo file to catch all file events
+	repoACLDir := filepath.Dir(ss.repoACLFile)
+	err = w.Add(repoACLDir)
+	if err != nil {
+		log.Printf("error adding repoACLDir %v to watcher: %v", repoACLDir, err)
+	}
+}
+
 func (ss *shardedSearcher) String() string {
 	return "shardedSearcher"
 }
@@ -381,6 +432,9 @@ func (ss *shardedSearcher) Close() {
 	ss.mu.Unlock()
 
 	ss.replace(shards)
+	if ss.repoACLFileWatcher != nil {
+		ss.repoACLFileWatcher.Close()
+	}
 }
 
 func selectRepoSet(shards []*rankedShard, q query.Q) ([]*rankedShard, query.Q) {
