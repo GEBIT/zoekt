@@ -319,7 +319,7 @@ func prepareGitOpts(repoDir string, repoName string) gitindex.Options {
 
 // Gets all repoDirs by file-walking the root repo dir
 // and indexes each repoDir sequentially
-func indexAll(incremental bool, rootRepoDir string) {
+func indexAll(incremental bool, isDelta bool, rootRepoDir string) {
 	repoDirs := walkRootRepoDir(rootRepoDir)
 
 	for _, repoDir := range repoDirs {
@@ -350,10 +350,15 @@ func indexAll(incremental bool, rootRepoDir string) {
 		}
 		gitOpts := prepareGitOpts(repoDir, repoName)
 		gitOpts.Incremental = incremental
+		gitOpts.BuildOptions.IsDelta = isDelta
 		markedForIndex[repoDir] = true
 		indexRepoWithGitOpts(repoDir, gitOpts)
 	}
-	initialIndexFinished = true
+
+	if !initialIndexFinished {
+		log.Printf("initial index finished")
+		initialIndexFinished = true
+	}
 }
 
 // Cleans up a given repoDir path.
@@ -479,8 +484,9 @@ func run() int {
 	go deleteOrphanIndexes(*indexDir)
 
 	// initial index run in the background
-	log.Println("initialIndex starting")
-	go indexAll(*incremental, *rootRepoDir)
+	log.Println("initialIndex non-incremental non-delta normal build starting")
+	// enforce non-incremental non-delta normal build
+	go indexAll(false, false, *rootRepoDir)
 
 	log.Printf("indexingApi starting on: %v", *listen)
 	err := startIndexingApi(*listen)
