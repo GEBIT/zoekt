@@ -37,6 +37,7 @@ import (
 	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/cmd"
@@ -50,8 +51,7 @@ const (
 )
 
 type indexRequest struct {
-	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
-	ProjectId                int    `json:"ProjectId,omitempty"`
+	ProjectId int `json:"ProjectId,omitempty"`
 }
 
 var (
@@ -188,7 +188,7 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --data '{"ProjectPathWithNamespace":"group/project", "ProjectId": 1234}' \
+//	  --data '{"ProjectId": 1234}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -201,7 +201,6 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projectPathWithNamespace := req.ProjectPathWithNamespace
 	projectId := req.ProjectId
 
 	// get the sha256 of the projectId
@@ -211,9 +210,6 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	// calculate repo dir from hexDigest of projecId
 	repoDir := fmt.Sprintf("%s/%s/%s/%s.git", REPOSITORIES_BASE_PATH, hexDigest[0:2], hexDigest[2:4], hexDigest)
-
-	log.Printf("received serveIndex request for projectPathWithNamespace: %v, projectId: %v, repoDir: %v",
-		projectPathWithNamespace, projectId, repoDir)
 
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
@@ -227,10 +223,18 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, fmt.Errorf("error opening git config for repo: %v", err))
 		return
 	}
+	repoName := getRepoNameFromConfig(repoConfig)
+	if repoName == "" {
+		log.Printf("repoName is empty for projectId: %v, repoDir: %v", projectId, repoDir)
+		respondWithError(w, fmt.Errorf("repoName is empty for projectId: %v, repoDir: %v", projectId, repoDir))
+		return
+	}
+
+	log.Printf("received serveIndex request for projectPathWithNamespace: %v, projectId: %v, repoDir: %v",
+		repoName, projectId, repoDir)
+
 	// check if skipindex flag is set
-	zoektSection := repoConfig.Raw.Section("gebit")
-	skipIndex := zoektSection.Options.Get("skipIndex")
-	if skipIndex == "true" {
+	if isSkipIndex(repoConfig) {
 		log.Printf("skipping index for repoDir %v", repoDir)
 
 		response := map[string]any{
@@ -244,7 +248,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// get copy of current gitOpts for new thread
-	gitOpts := prepareGitOpts(repoDir, projectPathWithNamespace)
+	gitOpts := prepareGitOpts(repoDir, repoName)
 
 	_, ok := indexRunning[repoDir]
 	if !ok {
@@ -334,19 +338,14 @@ func indexAll(incremental bool, isDelta bool, rootRepoDir string) {
 			continue
 		}
 		// check if skipindex flag is set
-		zoektSection := repoConfig.Raw.Section("gebit")
-		skipIndex := zoektSection.Options.Get("skipIndex")
-		if skipIndex == "true" {
+		if isSkipIndex(repoConfig) {
 			log.Printf("skipping index for repoDir %v", repoDir)
 			continue
 		}
-		gitlabSection := repoConfig.Raw.Section("gitlab")
-		repoName := gitlabSection.Options.Get("fullpath")
-		if len(repoName) == 0 {
-			// empty gitlab name, set hash as fallback for now
-			splitRepoDir := strings.Split(repoDir, "/")
-			repoName = strings.Replace(splitRepoDir[len(splitRepoDir)-1], ".git", "", -1)
-			log.Printf("No gitlab git config for repoDir: %v, falling back to hashed repoName: %v", repoDir, repoName)
+		repoName := getRepoNameFromConfig(repoConfig)
+		if repoName == "" {
+			log.Printf("repoName is empty for repoDir: %v, skip", repoDir)
+			continue
 		}
 		gitOpts := prepareGitOpts(repoDir, repoName)
 		gitOpts.Incremental = incremental
@@ -370,7 +369,18 @@ func sanitizeRepoDir(repoDir string) string {
 	return filepath.Clean(repoDir)
 }
 
-// File-walks the root repo dir and collects all symlinks (non-directories).
+func isSkipIndex(repoConfig *config.Config) bool {
+	gebitSection := repoConfig.Raw.Section("gebit")
+	skipIndex := gebitSection.Options.Get("skipIndex")
+	return skipIndex == "true"
+}
+
+func getRepoNameFromConfig(repoConfig *config.Config) string {
+	zoektSection := repoConfig.Raw.Section("zoekt")
+	return zoektSection.Options.Get("name")
+}
+
+// File-walks the root repo dir and collects directories ending in ".git", but not in ".wiki.git".
 // Returns a string slice containting all found repoDirs (ordered lexically).
 func walkRootRepoDir(rootRepoDir string) []string {
 	gitRepos := []string{}
@@ -382,8 +392,8 @@ func walkRootRepoDir(rootRepoDir string) []string {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() && strings.HasSuffix(path, ".git") {
-			// this is a directory ending in .git, collect it
+		if info.IsDir() && !strings.HasSuffix(path, ".wiki.git") && strings.HasSuffix(path, ".git") {
+			// this is a non-wiki directory ending in .git, collect it
 			gitRepos = append(gitRepos, sanitizeRepoDir(path))
 		}
 		return nil
