@@ -26,4 +26,6 @@ COPY --from=zoekt /usr/local/bin/zoekt-gebit-indexserver /usr/local/bin/
 # down from 50 to 25.
 # ENV GOGC=25
 
+HEALTHCHECK CMD test -w ${DATA_DIR} || exit 1
+
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/zoekt-gebit-indexserver"]
