@@ -422,8 +422,6 @@ func run() int {
 		"It also affects name if the indexed repository is under this directory.")
 	isDelta := flag.Bool("delta", false, "whether we should use delta build")
 	deltaShardNumberFallbackThreshold := flag.Uint64("delta_threshold", 0, "upper limit on the number of preexisting shards that can exist before attempting a delta build (0 to disable fallback behavior)")
-	offlineRanking := flag.String("offline_ranking", "", "the name of the file that contains the ranking info.")
-	offlineRankingVersion := flag.String("offline_ranking_version", "", "a version string identifying the contents in offline_ranking.")
 	languageMap := flag.String("language_map", "", "a mapping between a language and its ctags processor (a:0,b:3).")
 	indexDir := flag.String("index_dir", "", "directory holding index shards. Defaults to $data_dir/index/")
 	listen := flag.String("listen", ":6060", "listen on this address.")
@@ -458,8 +456,6 @@ func run() int {
 
 	globalBuildOpts = *cmd.OptionsFromFlags()
 	globalBuildOpts.IsDelta = *isDelta
-	globalBuildOpts.DocumentRanksPath = *offlineRanking
-	globalBuildOpts.DocumentRanksVersion = *offlineRankingVersion
 	globalBuildOpts.IndexDir = *indexDir
 	globalBuildOpts.LanguageMap = make(ctags.LanguageMap)
 	for _, mapping := range strings.Split(*languageMap, ",") {
