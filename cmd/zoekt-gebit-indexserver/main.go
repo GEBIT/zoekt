@@ -38,11 +38,12 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
-	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/build"
+
 	"github.com/sourcegraph/zoekt/cmd"
-	"github.com/sourcegraph/zoekt/ctags"
-	"github.com/sourcegraph/zoekt/gitindex"
+	"github.com/sourcegraph/zoekt/internal/ctags"
+	"github.com/sourcegraph/zoekt/internal/gitindex"
+
+	"github.com/sourcegraph/zoekt/index"
 )
 
 const (
@@ -65,7 +66,7 @@ var (
 	globalGitOpts gitindex.Options
 
 	// global copy of the buildOpts to use when using multiple threads
-	globalBuildOpts build.Options
+	globalBuildOpts index.Options
 
 	// tracks if the initial index run has finished
 	initialIndexFinished = false
@@ -83,13 +84,13 @@ func deleteIfOrphan(fn string) error {
 	}
 	defer f.Close()
 
-	ifile, err := zoekt.NewIndexFile(f)
+	ifile, err := index.NewIndexFile(f)
 	if err != nil {
 		return nil
 	}
 	defer ifile.Close()
 
-	repos, _, err := zoekt.ReadMetadata(ifile)
+	repos, _, err := index.ReadMetadata(ifile)
 	if err != nil {
 		return nil
 	}
@@ -118,8 +119,8 @@ func deleteIfOrphan(fn string) error {
 	return err
 }
 
-func deleteOrphanIndexes(indexDir string) {
-	t := time.NewTicker(time.Second * ORPHAN_CHECK_PERIOD_S)
+func deleteOrphanIndexes(indexDir string, watchInterval time.Duration) {
+	t := time.NewTicker(watchInterval)
 
 	expr := indexDir + "/*"
 	for {
@@ -479,7 +480,7 @@ func run() int {
 		Submodules:                        *submodules,
 		RepoCacheDir:                      *repoCacheDir,
 		AllowMissingBranch:                *allowMissing,
-		BuildOptions:                      build.Options{},
+		BuildOptions:                      index.Options{},
 		Branches:                          branches,
 		RepoDir:                           "",
 		DeltaShardNumberFallbackThreshold: *deltaShardNumberFallbackThreshold,
@@ -487,7 +488,7 @@ func run() int {
 	log.Println("globalGitOpts set")
 
 	log.Println("deleteOrphanIndexes starting")
-	go deleteOrphanIndexes(*indexDir)
+	go deleteOrphanIndexes(*indexDir, time.Second*ORPHAN_CHECK_PERIOD_S)
 
 	// initial index run in the background
 	log.Println("initialIndex non-incremental non-delta normal build starting")
