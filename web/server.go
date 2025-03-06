@@ -17,6 +17,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -205,6 +206,47 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	return mux, nil
 }
 
+// Checks the request for a basic auth header and uses the information
+// to perform an LDAP login.
+// Returns the username of the logged in user and a nil error, or
+// an empty string for the username and the error.
+func checkBasicAuth(r *http.Request) (string, error) {
+	// get http basic auth pre-emptive request header
+	basicAuth64 := r.Header.Get("Authorization")
+	// remove prefix
+	basicAuth64, found := strings.CutPrefix(basicAuth64, "Basic ")
+	if !found {
+		return "", fmt.Errorf("could not find prefix in basic auth header: %v", basicAuth64)
+	}
+	// decode base64 portion
+	basicAuthBytes, err := base64.StdEncoding.DecodeString(basicAuth64)
+	if err != nil {
+		return "", fmt.Errorf("error decoding basic auth: %v", err)
+	}
+	// convert bytes to string
+	basicAuth := string(basicAuthBytes)
+	// split into username:pw
+	basicAuthTokens := strings.Split(basicAuth, ":")
+	if len(basicAuthTokens) != 2 {
+		return "", fmt.Errorf("error splitting basic auth by colon: %v", basicAuth)
+	}
+	// connect to ldap using configured bind user
+	conn, err := zoekt.Connect()
+	if err != nil {
+		return "", fmt.Errorf("error connecting to ldap: %v", err)
+	}
+	// do the actual ldap login with username and pw from basic auth
+	loggedIn, errs := zoekt.Auth(conn, zoekt.UserLogin{Username: basicAuthTokens[0], Password: basicAuthTokens[1]})
+	if len(errs) != 0 {
+		return "", fmt.Errorf("errors logging in to ldap: %v", errs)
+	}
+	if !loggedIn {
+		return "", fmt.Errorf("error logging in to ldap")
+	}
+
+	return strings.ToLower(basicAuthTokens[0]), nil
+}
+
 func (s *Server) serveHealthz(w http.ResponseWriter, r *http.Request) {
 	q := &query.Const{Value: true}
 	opts := &zoekt.SearchOptions{ShardMaxMatchCount: 1, TotalMaxMatchCount: 1, MaxDocDisplayCount: 1}
@@ -252,6 +294,11 @@ func (s *Server) serveSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
+	userName, err := checkBasicAuth(r)
+	if err != nil {
+		return nil, err
+	}
+
 	qvals := r.URL.Query()
 
 	debugScore, _ := strconv.ParseBool(qvals.Get("debug"))
@@ -272,7 +319,7 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 		repoOnly = repoOnly && ok
 	})
 	if repoOnly {
-		repos, err := s.serveListReposErr(q, queryStr, r)
+		repos, err := s.serveListReposErr(q, queryStr, userName, r)
 		if err == nil {
 			return &ApiSearchResult{Repos: repos}, nil
 		}
@@ -280,7 +327,7 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 	}
 
 	if qt, ok := q.(*query.Type); ok && qt.Type == query.TypeRepo {
-		repos, err := s.serveListReposErr(q, queryStr, r)
+		repos, err := s.serveListReposErr(q, queryStr, userName, r)
 		if err == nil {
 			return &ApiSearchResult{Repos: repos}, nil
 		}
@@ -296,6 +343,7 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 
 	sOpts := zoekt.SearchOptions{
 		MaxWallTime: 10 * time.Second,
+		UserName:    userName,
 	}
 
 	numCtxLines := 0
@@ -467,9 +515,9 @@ func (s *Server) serveRobots(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) serveListReposErr(q query.Q, qStr string, r *http.Request) (*RepoListInput, error) {
+func (s *Server) serveListReposErr(q query.Q, qStr string, userName string, r *http.Request) (*RepoListInput, error) {
 	ctx := r.Context()
-	repos, err := s.Searcher.List(ctx, q, nil)
+	repos, err := s.Searcher.List(ctx, q, &zoekt.ListOptions{UserName: userName})
 	if err != nil {
 		return nil, err
 	}

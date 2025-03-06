@@ -12,6 +12,7 @@ require (
 	github.com/gfleury/go-bitbucket-v1 v0.0.0-20240917142304-df385efaac68
 	github.com/go-enry/go-enry/v2 v2.9.1
 	github.com/go-git/go-git/v5 v5.13.1
+	github.com/go-ldap/ldap/v3 v3.4.10
 	github.com/gobwas/glob v0.2.3
 	github.com/google/go-cmp v0.6.0
 	github.com/google/go-github/v27 v27.0.6
@@ -58,7 +59,9 @@ require (
 
 require (
 	github.com/42wim/httpsig v1.2.2 // indirect
+	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/davidmz/go-pageant v1.0.2 // indirect
+	github.com/go-asn1-ber/asn1-ber v1.5.7 // indirect
 	github.com/go-fed/httpsig v1.1.0 // indirect
 	github.com/hashicorp/go-version v1.7.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
