@@ -251,6 +251,10 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 	// get copy of current gitOpts for new thread
 	gitOpts := prepareGitOpts(repoDir, repoName)
 
+	// always do a full reindex
+	gitOpts.Incremental = false
+	gitOpts.BuildOptions.IsDelta = false
+
 	_, ok := indexRunning[repoDir]
 	if !ok {
 		// ensure indexRunning exists
