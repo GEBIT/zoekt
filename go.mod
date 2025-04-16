@@ -14,6 +14,7 @@ require (
 	github.com/go-git/go-git/v5 v5.13.1
 	github.com/go-ldap/ldap/v3 v3.4.10
 	github.com/gobwas/glob v0.2.3
+	github.com/golang-queue/queue v0.3.0
 	github.com/google/go-cmp v0.6.0
 	github.com/google/go-github/v27 v27.0.6
 	github.com/google/slothfs v0.0.0-20190717100203-59c1163fd173
@@ -64,6 +65,7 @@ require (
 	github.com/go-asn1-ber/asn1-ber v1.5.7 // indirect
 	github.com/go-fed/httpsig v1.1.0 // indirect
 	github.com/hashicorp/go-version v1.7.0 // indirect
+	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 )

@@ -19,7 +19,7 @@
 package main
 
 import (
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,17 +27,20 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
 	"sort"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/golang-queue/queue/core"
 
 	"github.com/sourcegraph/zoekt/cmd"
 	"github.com/sourcegraph/zoekt/internal/ctags"
@@ -48,28 +51,56 @@ import (
 
 const (
 	ORPHAN_CHECK_PERIOD_S  = 300
-	REPOSITORIES_BASE_PATH = "/var/lib/git/@hashed"
+	REPOSITORIES_BASE_PATH = "/r"
 )
 
+type indexAllRequest struct {
+	IsIncremental bool `json:"IsIncremental,omitempty"`
+	IsDelta       bool `json:"IsDelta,omitempty"`
+}
+
+func (j *indexAllRequest) Bytes() []byte {
+	return bytes(j)
+}
+
 type indexRequest struct {
-	ProjectId int `json:"ProjectId,omitempty"`
+	indexAllRequest
+	IsInitial                bool   `json:"IsInitial,omitempty"`
+	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
+}
+
+// Must get implemented a second time, so json.Marshal() picks up
+// the correct type and marshals all properties
+func (j *indexRequest) Bytes() []byte {
+	return bytes(j)
+}
+
+func bytes(req any) []byte {
+	b, err := json.Marshal(req)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 var (
-	// tracks which repoDirs should be indexed
-	markedForIndex = map[string]bool{}
-
-	// tracks for which repoDir an index operation is currently running
-	indexRunning = map[string]bool{}
-
 	// global copy of the gitOps to use when using multiple threads
 	globalGitOpts gitindex.Options
 
 	// global copy of the buildOpts to use when using multiple threads
 	globalBuildOpts index.Options
 
-	// tracks if the initial index run has finished
-	initialIndexFinished = false
+	// the root dir for the git bare repos to index
+	globalRootRepoDir string
+
+	// global reference to worker for getting running index tasks and accessing the queue
+	worker *indexWorker
+
+	// start time of initial index
+	inititalIndexStartTime time.Time
+
+	// duration of initial index
+	inititalIndexDuration time.Duration
 )
 
 /////////////////////////////////////////////////////////////////////
@@ -104,15 +135,6 @@ func deleteIfOrphan(fn string) error {
 	_, err = os.Stat(repo.Source)
 	if os.IsNotExist(err) {
 		log.Printf("deleting orphan shard %s; source %q not found", fn, repo.Source)
-		// cleanup maps to avoid mem leaks
-		_, ok := indexRunning[repo.Source]
-		if ok {
-			delete(indexRunning, repo.Source)
-		}
-		_, ok = markedForIndex[repo.Source]
-		if ok {
-			delete(markedForIndex, repo.Source)
-		}
 		return os.Remove(fn)
 	}
 
@@ -142,15 +164,22 @@ func deleteOrphanIndexes(indexDir string, watchInterval time.Duration) {
 // *Index* and respondWithError ORIGINALLY TAKEN FROM cmd/zoekt-dynamic-indexserver/main.go
 /////////////////////////////////////////////////////////////////////
 
-func startIndexingApi(listen string) error {
+func startIndexingApi(listen string) *http.Server {
+	server := &http.Server{
+		Addr: listen,
+	}
 	http.HandleFunc("/index", serveIndex)
+	http.HandleFunc("/indexAll", serveIndexAll)
 	http.HandleFunc("/status", serveStatus)
 
-	if err := http.ListenAndServe(listen, nil); err != nil {
-		log.Fatal(err)
-		return err
-	}
-	return nil
+	go func() {
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+		log.Println("Stopped serving new connections")
+	}()
+
+	return server
 }
 
 // Returns the current status of the indexer as json.
@@ -165,19 +194,25 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runningRepos := []string{}
-	for repoDir, isRunning := range indexRunning {
-		if isRunning {
-			runningRepos = append(runningRepos, repoDir)
-		}
-	}
-
-	sort.Strings(runningRepos)
+	numSubmitted := worker.q.SubmittedTasks()
+	numCompleted := worker.q.CompletedTasks()
+	numQueued := numSubmitted - numCompleted
+	numInitialSubmitted := worker.initialMetric.SubmittedTasks()
+	numInitialCompleted := worker.initialMetric.CompletedTasks()
+	numInitialQueued := numInitialSubmitted - numInitialCompleted
+	runningRepos := worker.muIndexDir.Running()
 
 	response := map[string]any{
-		"Success":              true,
-		"InitialIndexFinished": initialIndexFinished,
-		"RunningRepos":         runningRepos,
+		"Success":               true,
+		"RunningRepos":          runningRepos,
+		"BusyWorkers":           worker.q.BusyWorkers(),
+		"NumTotalSubmitted":     numSubmitted,
+		"NumTotalCompleted":     numCompleted,
+		"NumTotalQueued":        numQueued,
+		"NumInitialSubmitted":   numInitialSubmitted,
+		"NumInitialCompleted":   numInitialCompleted,
+		"NumInitialQueued":      numInitialQueued,
+		"InititalIndexDuration": fmt.Sprintf("%v", inititalIndexDuration),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -189,7 +224,36 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 // example curl:
 //
 //	curl --header "Content-Type: application/json" \
-//	  --data '{"ProjectId": 1234}' \
+//	  --data '{"IsIncremental": true, "IsDelta": true}' \
+//	  http://localhost:6060/indexAll
+func serveIndexAll(w http.ResponseWriter, r *http.Request) {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req indexAllRequest
+	err := dec.Decode(&req)
+	if err != nil {
+		log.Printf("Error decoding index request: %v", err)
+		http.Error(w, "JSON parser error", http.StatusBadRequest)
+		return
+	}
+	log.Printf("received valid serveIndexAll request, isInc: %v, isDelta: %v", req.IsIncremental, req.IsDelta)
+
+	go startIndexAll(req.IsIncremental, req.IsDelta, false)
+
+	response := map[string]any{
+		"Success": true,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// Requests an index operation of the given project.
+//
+// example curl:
+//
+//	curl --header "Content-Type: application/json" \
+//	  --data '{"ProjectPathWithNamespace": "gebit-build/gebit-build", "IsIncremental": false, "IsDelta": false}' \
 //	  http://localhost:6060/index
 func serveIndex(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
@@ -202,40 +266,22 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projectId := req.ProjectId
+	projectPathWithNamespace := req.ProjectPathWithNamespace
+	// ensure IsInitial is always false when coming from api
+	req.IsInitial = false
 
-	// get the sha256 of the projectId
-	h := sha256.New()
-	h.Write([]byte(strconv.Itoa(projectId)))
-	hexDigest := fmt.Sprintf("%x", h.Sum(nil))
+	repoDir := calcRepoDir(projectPathWithNamespace)
 
-	// calculate repo dir from hexDigest of projecId
-	repoDir := fmt.Sprintf("%s/%s/%s/%s.git", REPOSITORIES_BASE_PATH, hexDigest[0:2], hexDigest[2:4], hexDigest)
-
-	repo, err := git.PlainOpen(repoDir)
-	if err != nil {
-		log.Printf("error opening git repo: %v", err)
-		respondWithError(w, fmt.Errorf("error opening git repo: %v", err))
-		return
-	}
-	repoConfig, err := repo.Config()
-	if err != nil {
-		log.Printf("error opening git config for repo: %v", err)
-		respondWithError(w, fmt.Errorf("error opening git config for repo: %v", err))
-		return
-	}
-	repoName := getRepoNameFromConfig(repoConfig)
-	if repoName == "" {
-		log.Printf("repoName is empty for projectId: %v, repoDir: %v", projectId, repoDir)
-		respondWithError(w, fmt.Errorf("repoName is empty for projectId: %v, repoDir: %v", projectId, repoDir))
+	errStr, isSkipIndex := checkRepo(repoDir)
+	if errStr != "" {
+		respondWithError(w, fmt.Errorf("error checking repo: %v", errStr))
 		return
 	}
 
-	log.Printf("received serveIndex request for projectPathWithNamespace: %v, projectId: %v, repoDir: %v",
-		repoName, projectId, repoDir)
+	log.Printf("received valid serveIndex request for projectPathWithNamespace: %v, repoDir: %v, isInc: %v, isDelta: %v",
+		projectPathWithNamespace, repoDir, req.IsIncremental, req.IsDelta)
 
-	// check if skipindex flag is set
-	if isSkipIndex(repoConfig) {
+	if isSkipIndex {
 		log.Printf("skipping index for repoDir %v", repoDir)
 
 		response := map[string]any{
@@ -248,24 +294,12 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// get copy of current gitOpts for new thread
-	gitOpts := prepareGitOpts(repoDir, repoName)
-
-	// always do a full reindex
-	gitOpts.Incremental = false
-	gitOpts.BuildOptions.IsDelta = false
-
-	_, ok := indexRunning[repoDir]
-	if !ok {
-		// ensure indexRunning exists
-		indexRunning[repoDir] = false
+	err = worker.q.Queue(&req)
+	if err != nil {
+		log.Printf("error queueing task: %v for indexReq %v", err, req)
+		respondWithError(w, fmt.Errorf("error queueing task: %v for indexReq %v", err, req))
+		return
 	}
-
-	// mark this repoDir as running
-	markedForIndex[repoDir] = true
-
-	// (try to) start new thread for index operation
-	go indexRepoWithGitOpts(repoDir, gitOpts)
 
 	response := map[string]any{
 		"Success": true,
@@ -291,28 +325,20 @@ func respondWithError(w http.ResponseWriter, err error) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func calcRepoDir(projectPathWithNamespace string) string {
+	return fmt.Sprintf("%s/%s.git", globalRootRepoDir, projectPathWithNamespace)
+}
+
 // Indexes a given repoDir with the given gitOpts
 func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
-	if indexRunning[repoDir] {
-		log.Printf("IndexGitRepo dir: %v, name %v already running, skip", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
-		return
+	start := time.Now()
+	log.Printf("indexRepoWithGitOpts start, repoDir: %v", repoDir)
+	_, err := gitindex.IndexGitRepo(gitOpts)
+	if err != nil {
+		log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
 	}
-
-	// mark index running for this repo, prevents additional go routine starts
-	indexRunning[repoDir] = true
-
-	// run while markedForIndex is true, might get set again by a REST call
-	for markedForIndex[repoDir] {
-		markedForIndex[repoDir] = false
-		log.Printf("start IndexGitRepo dir: %v, name: %v", repoDir, gitOpts.BuildOptions.RepositoryDescription.Name)
-		_, err := gitindex.IndexGitRepo(gitOpts)
-		if err != nil {
-			log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
-		}
-	}
-
-	// index for this repoDir finished, track it
-	indexRunning[repoDir] = false
+	duration := time.Since(start)
+	log.Printf("indexRepoWithGitOpts finish, repoDir: %v, duration: %v", repoDir, duration)
 }
 
 // create copy of global opts for this index run and set run-specific values
@@ -326,42 +352,86 @@ func prepareGitOpts(repoDir string, repoName string) gitindex.Options {
 	return gitOpts
 }
 
-// Gets all repoDirs by file-walking the root repo dir
-// and indexes each repoDir sequentially
-func indexAll(incremental bool, isDelta bool, rootRepoDir string) {
-	repoDirs := walkRootRepoDir(rootRepoDir)
+func initialIndexFinished() {
+	inititalIndexDuration = time.Since(inititalIndexStartTime)
+	log.Println("deleteOrphanIndexes starting")
+	go deleteOrphanIndexes(globalBuildOpts.IndexDir, time.Second*ORPHAN_CHECK_PERIOD_S)
+}
 
-	for _, repoDir := range repoDirs {
-		repo, err := git.PlainOpen(repoDir)
+// File-walks the root repo dir and collects directories ending in ".git", but not in ".wiki.git".
+// Returns a string slice containting all found repoDirs (ordered lexically).
+func walkRootRepoDir(rootRepoDir string) []string {
+	start := time.Now()
+	gitRepos := []string{}
+
+	log.Printf("walkRootRepoDir start, rootRepoDir: %v", rootRepoDir)
+
+	// get gitRepos by walking the root repo file tree
+	err := filepath.Walk(rootRepoDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("error opening git repo: %v", err)
+			return err
+		}
+		if info.IsDir() && !strings.HasSuffix(path, ".wiki.git") && strings.HasSuffix(path, ".git") {
+			// this is a non-wiki directory ending in .git, collect it
+			gitRepos = append(gitRepos, sanitizeRepoDir(path))
+		}
+		return nil
+	})
+	if err != nil {
+		log.Println(err)
+		return nil
+	}
+
+	sort.Strings(gitRepos)
+
+	duration := time.Since(start)
+	log.Printf("walkRootRepoDir finish, rootRepoDir: %v, duration: %v", rootRepoDir, duration)
+	return gitRepos
+}
+
+// Gets all repoDirs by file-walking the root repo dir
+// and queues an index job for each repoDir
+func startIndexAll(incremental bool, delta bool, initial bool) {
+	if initial {
+		inititalIndexStartTime = time.Now()
+	}
+
+	repoDirs := walkRootRepoDir(globalRootRepoDir)
+	for _, repoDir := range repoDirs {
+		if _, err := os.Stat(repoDir); errors.Is(err, os.ErrNotExist) {
+			// repoDir does not exist, might have been deleted in the meantime
+			log.Printf("repoDir %v removed after walkRootRepoDir(), probably deleted, continuing", repoDir)
 			continue
 		}
-		repoConfig, err := repo.Config()
-		if err != nil {
-			log.Printf("error opening git config for repo: %v", err)
+
+		errStr, isSkipIndex := checkRepo(repoDir)
+		if errStr != "" {
+			// checkRepo() already logged
 			continue
 		}
 		// check if skipindex flag is set
-		if isSkipIndex(repoConfig) {
+		if isSkipIndex {
 			log.Printf("skipping index for repoDir %v", repoDir)
 			continue
 		}
-		repoName := getRepoNameFromConfig(repoConfig)
-		if repoName == "" {
-			log.Printf("repoName is empty for repoDir: %v, skip", repoDir)
-			continue
-		}
-		gitOpts := prepareGitOpts(repoDir, repoName)
-		gitOpts.Incremental = incremental
-		gitOpts.BuildOptions.IsDelta = isDelta
-		markedForIndex[repoDir] = true
-		indexRepoWithGitOpts(repoDir, gitOpts)
-	}
 
-	if !initialIndexFinished {
-		log.Printf("initial index finished")
-		initialIndexFinished = true
+		projectPathWithNamespace, _ := strings.CutPrefix(repoDir, globalRootRepoDir+"/")
+		projectPathWithNamespace, _ = strings.CutSuffix(projectPathWithNamespace, ".git")
+
+		// create index request for repo, ensuring full build
+		indexReq := indexRequest{
+			ProjectPathWithNamespace: projectPathWithNamespace,
+			IsInitial:                initial,
+			indexAllRequest: indexAllRequest{
+				IsIncremental: incremental,
+				IsDelta:       delta,
+			},
+		}
+
+		err := worker.q.Queue(&indexReq)
+		if err != nil {
+			log.Printf("error queueing task: %v for indexReq %v", err, indexReq)
+		}
 	}
 }
 
@@ -385,32 +455,121 @@ func getRepoNameFromConfig(repoConfig *config.Config) string {
 	return zoektSection.Options.Get("name")
 }
 
-// File-walks the root repo dir and collects directories ending in ".git", but not in ".wiki.git".
-// Returns a string slice containting all found repoDirs (ordered lexically).
-func walkRootRepoDir(rootRepoDir string) []string {
-	gitRepos := []string{}
-
-	log.Printf("start walkRootRepoDir at dir: %v", rootRepoDir)
-
-	// get gitRepos by walking the root repo file tree
-	err := filepath.Walk(rootRepoDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() && !strings.HasSuffix(path, ".wiki.git") && strings.HasSuffix(path, ".git") {
-			// this is a non-wiki directory ending in .git, collect it
-			gitRepos = append(gitRepos, sanitizeRepoDir(path))
-		}
-		return nil
-	})
+// Checks if a repo can and should be indexed.
+func checkRepo(repoDir string) (string, bool) {
+	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
-		log.Println(err)
-		return nil
+		msg := fmt.Sprintf("error opening git repo: %v", err)
+		log.Printf(msg)
+		return msg, true
+	}
+	repoConfig, err := repo.Config()
+	if err != nil {
+		msg := fmt.Sprintf("error opening git config for repo: %v", err)
+		log.Printf(msg)
+		return msg, true
+	}
+	repoName := getRepoNameFromConfig(repoConfig)
+	if repoName == "" {
+		msg := fmt.Sprintf("repoName is empty for repoDir: %v, repoDir: %v", repoDir, repoDir)
+		log.Printf(msg)
+		return msg, true
 	}
 
-	sort.Strings(gitRepos)
+	return "", isSkipIndex(repoConfig)
+}
 
-	return gitRepos
+// Callback for the indexWorker, unmarshals a task message into an index request
+// and does the actual indexing.
+func indexRepoTask(ctx context.Context, m core.TaskMessage) error {
+	req, err := UnmarshalReq(m)
+	if err != nil {
+		return err
+	}
+
+	repoDir := calcRepoDir(req.ProjectPathWithNamespace)
+
+	fetchGitRepo(repoDir)
+
+	gitOpts := prepareGitOpts(repoDir, req.ProjectPathWithNamespace)
+	gitOpts.Incremental = req.IsIncremental
+	gitOpts.BuildOptions.IsDelta = req.IsDelta
+
+	indexRepoWithGitOpts(repoDir, gitOpts)
+
+	return err
+}
+
+// fetchGitRepo runs git-fetch, and returns true if there was an
+// update.
+// originally taken from cmd/zoekt-indexserver.go
+func fetchGitRepo(repoDir string) bool {
+	start := time.Now()
+	log.Printf("fetchGitRepo start, repoDir: %v", repoDir)
+
+	cmd := exec.Command("git", "--git-dir", repoDir, "fetch", "origin",
+		"--prune",
+		"--no-tags",
+		"--depth=1",
+		"+refs/heads/*:refs/remotes/origin/*",
+		"^refs/heads/feature/*",
+		"^refs/heads/deps/*",
+		"^refs/heads/user/*",
+		"^refs/heads/users/*")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("command %s failed: %v\nCOMBINED_OUT: %s\n",
+			cmd.Args, err, string(output))
+		return false
+	}
+	duration := time.Since(start)
+	log.Printf("fetchGitRepo finish, repoDir: %v, duration: %v", repoDir, duration)
+	// When fetch found no updates, it prints nothing out
+	return len(output) != 0
+}
+
+// Checks the repoDirs of all running index tasks if they have left over
+// a shallow.lock file. If one is found, it is removed.
+func cleanupShallowLocks() {
+	runningRepos := worker.muIndexDir.Running()
+	for _, repo := range runningRepos {
+		shallowLock := globalRootRepoDir + "/" + repo + ".git/shallow.lock"
+		log.Printf("checking shallow lock %v", shallowLock)
+		if _, err := os.Stat(shallowLock); err == nil {
+			// shallow lock exists, remove it
+			err = os.Remove(shallowLock)
+			if err != nil {
+				log.Printf("error removing shallow lock %v: %v", shallowLock, err)
+			} else {
+				log.Printf("found shallow lock %v, removed it", shallowLock)
+			}
+		}
+	}
+}
+
+func shutdown(httpServer *http.Server) {
+	log.Printf("shutdown sequence initiated")
+
+	// http server shutdown, allow 5 seconds, so we still have 5 seconds before docker uses a kill signal
+	shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownRelease()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+	log.Println("Graceful HTTP shutdown complete")
+
+	// set worker count to 0
+	worker.q.UpdateWorkerCount(0)
+	// run Release() as a separate go function, so we dont wait for it to finish
+	// but no new jobs can start
+	go worker.q.Release()
+	log.Printf("worker count set to 0 and queue release started in background")
+
+	// cleanup shallow lock files of interrupted git fetches
+	cleanupShallowLocks()
+
+	log.Printf("shutdown sequence finished")
 }
 
 func run() int {
@@ -431,6 +590,7 @@ func run() int {
 	indexDir := flag.String("index_dir", "", "directory holding index shards. Defaults to $data_dir/index/")
 	listen := flag.String("listen", ":6060", "listen on this address.")
 	rootRepoDir := flag.String("root_repo_dir", REPOSITORIES_BASE_PATH, "path to the root directory of all repos")
+	numWorkers := flag.Int64("num_workers", 2, "the number of workers to use for index tasks")
 	flag.Parse()
 
 	log.Println("flags parsed")
@@ -458,6 +618,8 @@ func run() int {
 		*repoCacheDir = dir
 	}
 	log.Println("repoCacheDir set")
+
+	globalRootRepoDir = *rootRepoDir
 
 	globalBuildOpts = *cmd.OptionsFromFlags()
 	globalBuildOpts.IsDelta = *isDelta
@@ -491,22 +653,27 @@ func run() int {
 	}
 	log.Println("globalGitOpts set")
 
-	log.Println("deleteOrphanIndexes starting")
-	go deleteOrphanIndexes(*indexDir, time.Second*ORPHAN_CHECK_PERIOD_S)
+	log.Println("indexQueue starting")
+	worker = NewIndexWorker(*numWorkers, initialIndexFinished)
 
-	// initial index run in the background
-	log.Println("initialIndex non-incremental non-delta normal build starting")
-	// enforce non-incremental non-delta normal build
-	go indexAll(false, false, *rootRepoDir)
+	log.Println("startIndexAll non-incremental non-delta normal build starting")
+	// initial index run
+	startIndexAll(false, false, true)
 
 	log.Printf("indexingApi starting on: %v", *listen)
-	err := startIndexingApi(*listen)
-	exitStatus := 0
-	if err != nil {
-		exitStatus = 1
-	}
+	httpServer := startIndexingApi(*listen)
 
-	return exitStatus
+	defer shutdown(httpServer)
+
+	// make a channel to receivce os signals
+	sigChan := make(chan os.Signal, 1)
+	// handle SIGINT and SIGTERM, so we can do graceful shutdown
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// block main go routine and wait for signal to arrive
+	<-sigChan
+
+	// returning here will run all deferred function calls (especially shutdown())
+	return 0
 }
 
 func main() {
