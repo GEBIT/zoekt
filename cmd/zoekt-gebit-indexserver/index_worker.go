@@ -44,7 +44,7 @@ func (i *indexWorker) Run(ctx context.Context, task core.TaskMessage) error {
 		return err
 	}
 
-	ran := i.muIndexDir.With(r.ProjectPathWithNamespace, func() {
+	ran := i.muIndexDir.With(r, func() {
 		err = i.w.Run(ctx, task)
 	})
 	if r.IsInitial {

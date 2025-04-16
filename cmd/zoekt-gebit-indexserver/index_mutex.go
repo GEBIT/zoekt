@@ -27,24 +27,25 @@ type indexMutex struct {
 
 	// running maps by name since that is what we key by on disk. Once we start
 	// keying by repo ID on disk, we should switch to uint32.
-	running map[string]struct{}
+	running map[string]*indexRequest
 }
 
 // With runs f if no other f with the same repoName is running. If f runs true
 // is returned, otherwise false is returned.
 //
 // With blocks if f runs or the Global lock is held.
-func (m *indexMutex) With(repoName string, f func()) bool {
+func (m *indexMutex) With(req *indexRequest, f func()) bool {
 	m.indexMu.RLock()
 	defer m.indexMu.RUnlock()
 
 	// init running; check and set running[repoName]
 	m.runningMu.Lock()
 	if m.running == nil {
-		m.running = map[string]struct{}{}
+		m.running = map[string]*indexRequest{}
 	}
+	repoName := req.ProjectPathWithNamespace
 	_, alreadyRunning := m.running[repoName]
-	m.running[repoName] = struct{}{}
+	m.running[repoName] = req
 	m.runningMu.Unlock()
 
 	if alreadyRunning {
@@ -101,7 +102,7 @@ var (
  ****************/
 // Returns the project paths with namespace that have an index task
 // currently running, sorted.
-func (m *indexMutex) Running() []string {
+func (m *indexMutex) Running() []*indexRequest {
 	m.indexMu.RLock()
 	defer m.indexMu.RUnlock()
 
@@ -109,11 +110,11 @@ func (m *indexMutex) Running() []string {
 	defer m.runningMu.Unlock()
 
 	if m.running == nil {
-		return []string{}
+		return []*indexRequest{}
 	}
-	running := []string{}
+	running := []*indexRequest{}
 	for _, k := range slices.Sorted(maps.Keys(m.running)) {
-		running = append(running, k)
+		running = append(running, m.running[k])
 	}
 	return running
 }

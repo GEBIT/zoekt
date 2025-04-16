@@ -55,8 +55,8 @@ const (
 )
 
 type indexAllRequest struct {
-	IsIncremental bool `json:"IsIncremental,omitempty"`
-	IsDelta       bool `json:"IsDelta,omitempty"`
+	IsIncremental bool
+	IsDelta       bool
 }
 
 func (j *indexAllRequest) Bytes() []byte {
@@ -65,8 +65,8 @@ func (j *indexAllRequest) Bytes() []byte {
 
 type indexRequest struct {
 	indexAllRequest
-	IsInitial                bool   `json:"IsInitial,omitempty"`
-	ProjectPathWithNamespace string `json:"ProjectPathWithNamespace,omitempty"`
+	IsInitial                bool
+	ProjectPathWithNamespace string
 }
 
 // Must get implemented a second time, so json.Marshal() picks up
@@ -200,11 +200,11 @@ func serveStatus(w http.ResponseWriter, r *http.Request) {
 	numInitialSubmitted := worker.initialMetric.SubmittedTasks()
 	numInitialCompleted := worker.initialMetric.CompletedTasks()
 	numInitialQueued := numInitialSubmitted - numInitialCompleted
-	runningRepos := worker.muIndexDir.Running()
+	runningReqs := worker.muIndexDir.Running()
 
 	response := map[string]any{
 		"Success":               true,
-		"RunningRepos":          runningRepos,
+		"RunningReqs":           runningReqs,
 		"BusyWorkers":           worker.q.BusyWorkers(),
 		"NumTotalSubmitted":     numSubmitted,
 		"NumTotalCompleted":     numCompleted,
@@ -332,13 +332,16 @@ func calcRepoDir(projectPathWithNamespace string) string {
 // Indexes a given repoDir with the given gitOpts
 func indexRepoWithGitOpts(repoDir string, gitOpts gitindex.Options) {
 	start := time.Now()
-	log.Printf("indexRepoWithGitOpts start, repoDir: %v", repoDir)
+	log.Printf("indexRepoWithGitOpts start, repoDir: %v, isInc: %v, isDelta: %v",
+		repoDir, gitOpts.Incremental, gitOpts.BuildOptions.IsDelta)
 	_, err := gitindex.IndexGitRepo(gitOpts)
 	if err != nil {
-		log.Printf("error in IndexGitRepo(%s, delta=%t): %v", repoDir, gitOpts.BuildOptions.IsDelta, err)
+		log.Printf("error in IndexGitRepo(%s, inc=%t, delta=%t): %v",
+			repoDir, gitOpts.Incremental, gitOpts.BuildOptions.IsDelta, err)
 	}
 	duration := time.Since(start)
-	log.Printf("indexRepoWithGitOpts finish, repoDir: %v, duration: %v", repoDir, duration)
+	log.Printf("indexRepoWithGitOpts finish, repoDir: %v, isInc: %v, isDelta: %v, duration: %v",
+		repoDir, gitOpts.Incremental, gitOpts.BuildOptions.IsDelta, duration)
 }
 
 // create copy of global opts for this index run and set run-specific values
@@ -532,9 +535,9 @@ func fetchGitRepo(repoDir string) bool {
 // Checks the repoDirs of all running index tasks if they have left over
 // a shallow.lock file. If one is found, it is removed.
 func cleanupShallowLocks() {
-	runningRepos := worker.muIndexDir.Running()
-	for _, repo := range runningRepos {
-		shallowLock := globalRootRepoDir + "/" + repo + ".git/shallow.lock"
+	runningReqs := worker.muIndexDir.Running()
+	for _, req := range runningReqs {
+		shallowLock := globalRootRepoDir + "/" + req.ProjectPathWithNamespace + ".git/shallow.lock"
 		log.Printf("checking shallow lock %v", shallowLock)
 		if _, err := os.Stat(shallowLock); err == nil {
 			// shallow lock exists, remove it
