@@ -594,6 +594,7 @@ func run() int {
 	listen := flag.String("listen", ":6060", "listen on this address.")
 	rootRepoDir := flag.String("root_repo_dir", REPOSITORIES_BASE_PATH, "path to the root directory of all repos")
 	numWorkers := flag.Int64("num_workers", 2, "the number of workers to use for index tasks")
+	initialFullBuild := flag.Bool("initial_full_build", true, "whether we want to start the initial full build")
 	flag.Parse()
 
 	log.Println("flags parsed")
@@ -659,9 +660,16 @@ func run() int {
 	log.Println("indexQueue starting")
 	worker = NewIndexWorker(*numWorkers, initialIndexFinished)
 
-	log.Println("startIndexAll non-incremental non-delta normal build starting")
-	// initial index run
-	startIndexAll(false, false, true)
+	if *initialFullBuild {
+		log.Println("startIndexAll non-incremental non-delta normal build starting")
+		// initial index run
+		startIndexAll(false, false, true)
+	} else {
+		// if we don't want the initial index, set duration to 0 and
+		// execute callback as if it was finished
+		inititalIndexDuration = 0
+		initialIndexFinished()
+	}
 
 	log.Printf("indexingApi starting on: %v", *listen)
 	httpServer := startIndexingApi(*listen)
