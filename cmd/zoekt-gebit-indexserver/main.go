@@ -266,33 +266,11 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projectPathWithNamespace := req.ProjectPathWithNamespace
 	// ensure IsInitial is always false when coming from api
 	req.IsInitial = false
 
-	repoDir := calcRepoDir(projectPathWithNamespace)
-
-	errStr, isSkipIndex := checkRepo(repoDir)
-	if errStr != "" {
-		respondWithError(w, fmt.Errorf("error checking repo: %v", errStr))
-		return
-	}
-
-	log.Printf("received valid serveIndex request for projectPathWithNamespace: %v, repoDir: %v, isInc: %v, isDelta: %v",
-		projectPathWithNamespace, repoDir, req.IsIncremental, req.IsDelta)
-
-	if isSkipIndex {
-		log.Printf("skipping index for repoDir %v", repoDir)
-
-		response := map[string]any{
-			"Success": true,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(response)
-
-		return
-	}
+	log.Printf("received valid serveIndex request for projectPathWithNamespace: %v, isInc: %v, isDelta: %v",
+		req.ProjectPathWithNamespace, req.IsIncremental, req.IsDelta)
 
 	err = worker.q.Queue(&req)
 	if err != nil {
@@ -300,6 +278,10 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, fmt.Errorf("error queueing task: %v for indexReq %v", err, req))
 		return
 	}
+	// alternative way of queueing, put the incoming request into the reschedule map
+	// this results in a delay of 0-10 seconds before the indexing actually starts
+	// it might help reducing load spikes and a laggy gitlab web IDE
+	// worker.RescheduledReqs.Store(req.ProjectPathWithNamespace, &req)
 
 	response := map[string]any{
 		"Success": true,
@@ -407,17 +389,6 @@ func startIndexAll(incremental bool, delta bool, initial bool) {
 			continue
 		}
 
-		errStr, isSkipIndex := checkRepo(repoDir)
-		if errStr != "" {
-			// checkRepo() already logged
-			continue
-		}
-		// check if skipindex flag is set
-		if isSkipIndex {
-			log.Printf("skipping index for repoDir %v", repoDir)
-			continue
-		}
-
 		projectPathWithNamespace, _ := strings.CutPrefix(repoDir, globalRootRepoDir+"/")
 		projectPathWithNamespace, _ = strings.CutSuffix(projectPathWithNamespace, ".git")
 
@@ -459,27 +430,23 @@ func getRepoNameFromConfig(repoConfig *config.Config) string {
 }
 
 // Checks if a repo can and should be indexed.
-func checkRepo(repoDir string) (string, bool) {
+func checkRepo(repoDir string) (bool, error) {
 	repo, err := git.PlainOpen(repoDir)
 	if err != nil {
-		msg := fmt.Sprintf("error opening git repo: %v", err)
-		log.Printf(msg)
-		return msg, true
-	}
-	repoConfig, err := repo.Config()
-	if err != nil {
-		msg := fmt.Sprintf("error opening git config for repo: %v", err)
-		log.Printf(msg)
-		return msg, true
-	}
-	repoName := getRepoNameFromConfig(repoConfig)
-	if repoName == "" {
-		msg := fmt.Sprintf("repoName is empty for repoDir: %v, repoDir: %v", repoDir, repoDir)
-		log.Printf(msg)
-		return msg, true
+		return true, err
 	}
 
-	return "", isSkipIndex(repoConfig)
+	repoConfig, err := repo.Config()
+	if err != nil {
+		return true, err
+	}
+
+	repoName := getRepoNameFromConfig(repoConfig)
+	if repoName == "" {
+		return true, fmt.Errorf("repoName is empty for repoDir: %v", repoDir)
+	}
+
+	return isSkipIndex(repoConfig), nil
 }
 
 // Callback for the indexWorker, unmarshals a task message into an index request
@@ -491,6 +458,17 @@ func indexRepoTask(ctx context.Context, m core.TaskMessage) error {
 	}
 
 	repoDir := calcRepoDir(req.ProjectPathWithNamespace)
+
+	isSkipIndex, err := checkRepo(repoDir)
+	if err != nil {
+		log.Printf("error checking project %v: %v", req.ProjectPathWithNamespace, err)
+		return err
+	}
+	// check if skipIndex flag is set
+	if isSkipIndex {
+		log.Printf("skipping index for repoDir %v", repoDir)
+		return nil
+	}
 
 	fetchGitRepo(repoDir)
 
@@ -665,9 +643,7 @@ func run() int {
 		// initial index run
 		startIndexAll(false, false, true)
 	} else {
-		// if we don't want the initial index, set duration to 0 and
-		// execute callback as if it was finished
-		inititalIndexDuration = 0
+		// if we don't want the initial index, execute callback as if it was finished
 		initialIndexFinished()
 	}
 

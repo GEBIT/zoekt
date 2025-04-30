@@ -21,7 +21,7 @@ type indexWorker struct {
 	// counter metric for initial index run
 	initialMetric queue.Metric
 	// rescheduled requests
-	rescheduledReqs sync.Map
+	RescheduledReqs sync.Map
 	// callback function after initial index is finished
 	initialFinished func()
 }
@@ -55,7 +55,7 @@ func (i *indexWorker) Run(ctx context.Context, task core.TaskMessage) error {
 	}
 	if !ran {
 		log.Printf("index job for repository already running, putting into reschedule: %s", r.ProjectPathWithNamespace)
-		i.rescheduledReqs.Store(r.ProjectPathWithNamespace, r)
+		i.RescheduledReqs.Store(r.ProjectPathWithNamespace, r)
 	}
 	if err != nil {
 		log.Printf("indexing %s failed: %s", r.ProjectPathWithNamespace, err)
@@ -107,14 +107,14 @@ func (i *indexWorker) reschedule(watchInterval time.Duration) {
 
 	for {
 		// drain the pool of rescheduled requests and re-queue them
-		i.rescheduledReqs.Range(func(key, value any) bool {
+		i.RescheduledReqs.Range(func(key, value any) bool {
 			req := value.(*indexRequest)
 			err := i.q.Queue(req)
 			if err != nil {
 				log.Printf("error rescheduling req: %v", req)
 			}
 			// this is allowed as per docs
-			i.rescheduledReqs.Delete(key)
+			i.RescheduledReqs.Delete(key)
 			return true
 		})
 		<-t.C
@@ -131,7 +131,7 @@ func NewIndexWorker(numWorkers int64, fn func()) *indexWorker {
 		initialFinished: fn,
 	}
 	w.q = queue.NewPool(numWorkers, queue.WithWorker(&w))
-	w.rescheduledReqs = sync.Map{}
+	w.RescheduledReqs = sync.Map{}
 	go w.reschedule(10 * time.Second)
 	return &w
 }
